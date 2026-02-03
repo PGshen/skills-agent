@@ -11,6 +11,16 @@
 - 把安全与可控作为一等约束：最小权限、审批、预算限制、失败降级
 - 支持评估与回归：在 MockModel 下离线重放动作序列并判分
 
+## 1.1 Agent Core 的系统定位（中枢）
+
+Agent Core 是整个程序的核心中枢（orchestrator），职责是把“模型决策、技能系统、工具执行、输出回显、落盘审计”串成一个可控的执行流水线：
+
+- 输入侧：接收用户请求（CLI/服务端），初始化 Run State 与预算
+- 决策侧：通过 Model Adapter 发起 `Decide` 请求，拿到结构化动作与（可选）Plan 更新
+- 执行侧：对动作做校验与路由，委派给 Skill Loader / Tools Runtime，并收集 observation
+- 观测侧：把执行过程以事件流方式对外输出（控制台、HTTP/SSE/WebSocket 等）
+- 审计侧：将关键事件与产物落盘，支持回显、回放与评估
+
 ## 2. Agent 运行模型（ReAct + 显式 Plan）
 
 ### 2.1 为什么是 ReAct + 显式 Plan
@@ -24,6 +34,12 @@
 - 每一轮只允许一次模型调用（一次 Decide）：模型在同一响应中完成“是否更新 Plan + 输出下一步结构化动作”
 - Observe 不是模型调用：Observe 是 Agent 执行动作后的结果（observation），注入上下文后进入下一轮 Decide
 - 模型不能直接执行工具：必须输出结构化动作，由 Agent Core 校验后委派给 Tools Runtime / Skill Loader
+
+### 2.3 Plan 与 ReAct 的配合方式（执行视角）
+
+- Plan 创建：在 `IndexSkills` 后第一次 `Decide` 的提示词中要求模型产出初始 Plan（通常粗粒度）并给出下一步动作
+- Plan 更新：每次动作执行后的 observation 被注入上下文，在下一次 `Decide` 中由模型更新 Plan（全量或 patch）
+- 计划与动作解耦：Plan 是“你打算怎么做”，结构化动作是“你下一步做什么”；Agent Core 每轮只执行一个动作，以 observation 驱动下一轮改计划
 
 ## 3. 总体时序与状态机
 
@@ -129,6 +145,75 @@ Agent Core 维护 Run State，驱动整个多轮执行过程并用于审计与�
   - 全量替换：`plan` 字段返回完整新计划
   - 增量更新：`plan_update` 以 patch 形式描述变更（便于审计与评估）
 
+## 4.4 对外输出：事件流（实时回显）
+
+执行过程对外输出建议采用“事件流”（event stream）而不是直接打印日志字符串。Agent Core 在关键节点产出结构化事件，由不同输出后端消费：
+
+- 控制台：实时打印简化版事件（适合 CLI）
+- 文件：JSONL 逐行写入（适合回放/审计/评估）
+- 服务端：以 SSE/WebSocket/HTTP chunked streaming 向客户端推送事件（适合 UI）
+
+事件粒度建议覆盖：
+
+- Run 级：`run_started` / `run_finished`
+- Turn 级：`turn_started` / `turn_finished`
+- 模型级：`model_request` / `model_response`（不记录敏感原文时可只记录摘要与哈希）
+- 动作级：`action_planned` / `action_validated` / `action_executed`
+- 观察级：`observation_recorded`
+- 计划级：`plan_created` / `plan_updated`
+- 审批级：`approval_required` / `approval_granted` / `approval_denied`
+
+建议事件格式（示意）：
+
+```json
+{
+  "ts": "2026-02-03T12:34:56.789Z",
+  "run_id": "20260203_123456_abcd",
+  "turn": 3,
+  "type": "action_executed",
+  "data": {
+    "action": "run_script",
+    "skill": {"name": "pdf-form-filler", "source": "project"},
+    "relative_path": "scripts/fill.py",
+    "result": {"exit_code": 0, "stdout_chars": 1823}
+  }
+}
+```
+
+说明：
+
+- “实时传输出执行过程”本质是流式输出事件，不强依赖模型 token 级流式输出；即使模型不支持逐 token streaming，事件流仍可完整回显“在做什么、做到哪一步、结果如何”。
+- 理想情况下支持 token 级流式输出：在模型以“结构化 JSON”格式输出动作的前提下，通过流式解析 JSON 字符流实现增量回显，从而同时满足“结构化可控”与“token 级体验”。
+
+### 4.5 Token 级流式输出：结构化 JSON 的流式解析
+
+目标：Agent Core 每次 `Decide` 的模型输出结构固定（JSON schema 固定），因此可以让模型以 JSON（或 JSON + SSE）流式返回。Agent Core 边接收边解析，尽早得到：
+
+- action 的关键字段（例如 action.type、skill.name 等），用于尽早回显“正在做什么”
+- 字符串字段的增量（例如 final_answer 的文本），用于 token 级体验（delta events）
+
+推荐采用“手写有限状态机 + 路径匹配”的流式 JSON 解析器，能力要点：
+
+- 输入：chunk 字符流（SSE data 段或 HTTP chunked body）
+- 增量解析：逐字符状态机，维护对象/数组栈、当前 path、缓冲区
+- 路径匹配：按 JSONPath 风格（例如 `$.action.type` / `$.final_answer.content` / `$.plan_update.steps[*].title`）触发回调
+- 两种回调模式：
+  - realtime：解析过程中实时回调
+  - incremental：对字符串值只发送新增片段（delta），避免重复发送完整字符串
+
+事件映射建议：
+
+- 解析到 `$.action.type`：产出 `action_planned`（或 action_partial）事件
+- 解析到 `$.action.*` 关键字段逐步齐全：产出 `action_validated` 之前的“预回显”事件
+- 解析到 `$.final_answer` 的字符串字段：以 `assistant_delta` 事件持续输出增量文本
+- 当 JSON 根对象闭合：产出 `model_response` 完整对象，进入动作校验与执行
+
+边界与约束：
+
+- 如果流式 JSON 最终校验失败（不闭合/非法），Agent Core 必须回退到“本轮失败”处理：记录审计并触发降级或重试
+- 解析器只负责“提取字段并发事件”，最终动作仍必须通过完整 JSON 校验与 Guardrails
+- streaming 只影响回显与体验，不改变 Agent Core 的单轮语义：每轮仍是一条动作（+可选 plan_update）
+
 ## 5. 结构化动作协议（Agent Core 侧约束）
 
 动作协议的完整定义由 [model-adapter.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/model-adapter.md) 展开；Agent Core 关注的是“允许哪些动作、何时允许、如何校验、如何执行”。
@@ -194,6 +279,34 @@ Agent Core 在构造模型输入时按固定分区拼装，以便评估、调试
 - Loaded Skills：已加载技能正文（可裁剪）
 - Observations：工具/脚本/资源读取结果（摘要 + 指向来源）
 
+### 7.3 控制上下文长度：避免循环累积过长
+
+ReAct 主循环天然会累积“对话历史 + 技能正文 + 工具输出”，Agent Core 需要提供上下文裁剪与压缩策略，避免 token 持续增长导致性能下降或超窗。
+
+建议采用“分层上下文 + 可丢弃策略”：
+
+1. 不可丢弃（短且关键）
+   - 用户请求（原文）
+   - 当前 Plan 摘要（goal + 当前 step + 约束）
+   - 预算剩余（turn/tool/script）
+   - 已加载技能列表（名称+source，避免重复加载）
+
+2. 可裁剪（按上限保留）
+   - 近期 N 轮 observations（保留摘要，丢弃大块原始输出）
+   - 已加载技能正文（保留必要段落；其余以“引用路径 + 章节标题”代替）
+
+3. 可替换为摘要（超过阈值触发）
+   - 历史 observations：压缩成“发生了什么 + 关键结论 + 指向产物/文件路径”
+   - 历史决策：压缩成“为什么这么选技能/为什么走这条路径”
+
+触发与执行方式：
+
+- 触发：当 `max_context_chars`（或估算 token）接近上限时触发 compaction
+- 执行：优先使用确定性规则裁剪（例如输出截断、保留尾部、保留关键字段）
+- 允许增强：在不调用工具的前提下增加一次“压缩上下文”的模型调用，用于生成更高质量摘要，但必须计入预算与审计
+
+核心原则：裁剪/摘要不应破坏 Skills 的“可追溯性”，被丢弃的内容应通过“指向落盘文件/事件 id”保持可回放。
+
 ## 8. 预算与退出条件
 
 ### 8.1 预算（Budget）
@@ -241,6 +354,33 @@ Agent Core 输出的 AuditTrail 建议包含：
 - 动作序列合规判分（必须先 select_skills 才能 load_resource/run_script）
 - 预算合规判分
 - 安全策略命中判分
+
+### 10.1 落盘策略（Run Directory）
+
+为支持回显、可回放与审计，Agent Core 在每次 run 创建独立目录并将“事件流 + 关键快照 + 产物”落盘。建议结构：
+
+```
+.agent/runs/<run_id>/
+  events.jsonl              # 事件流（逐行 JSON，便于 tail/流式回放）
+  state.json                # Run State 快照（可选：每轮覆盖写）
+  final.md                  # 最终输出（如有）
+  inputs/
+    request.txt             # 原始输入（可选：脱敏后）
+  artifacts/                # 工具/脚本产物归档（可选）
+  observations/             # 大块输出单独存文件，events 仅存引用
+```
+
+落盘原则：
+
+- `events.jsonl` 是事实来源（source of truth），用于回放与审计
+- 大块内容（脚本 stdout、resource 全文片段）不直接塞进事件 data，可落到 `observations/` 并在事件里存文件引用与哈希
+- 脱敏优先：对可能含敏感信息的字段存 hash/摘要，必要时提供配置开关允许保存原文
+
+### 10.2 回放（Replay）与回显（Playback）
+
+- 回显：客户端或 CLI 订阅事件流实时显示进度；历史回显从 `events.jsonl` 顺序重放
+- 回放：评估/审计工具读取 `events.jsonl`，重建 turn 序列与动作链，验证合规性与复现实验
+- 关键好处：即便上下文做了裁剪，完整过程仍可通过“事件 + 大块落盘内容引用”重建
 
 ## 11. 与其他子系统的接口契约（概要）
 
