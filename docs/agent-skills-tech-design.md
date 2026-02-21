@@ -12,7 +12,7 @@
 - 支持渐进式披露三层加载：
   - 启动仅加载 `name/description` 形成技能索引
   - 触发时加载 `SKILL.md` 正文
-  - 需要时再读取 resource 或执行 scripts，并将“结果”注入上下文
+  - 需要时再读取 resource 或执行 scripts，并将"结果"注入上下文
 - 支持多技能根目录与优先级：项目级、用户级、内置级。
 - 支持技能分发：技能包（zip）安装/卸载/列出/校验。
 - 支持权限模型（最小权限）：
@@ -20,6 +20,10 @@
   - Agent 运行时强制执行白名单与高风险动作审批
 - 支持技能可组合：一次任务可触发多个技能，并有冲突与优先级规则。
 - 提供可评估能力（Evals）：基于用例集对触发、步骤、输出进行回归。
+- 支持容错与恢复：错误处理、重试策略、Plan持久化与崩溃恢复。
+- 支持上下文管理：token限制下的智能裁剪与技能内容优先级管理。
+- 支持资源配额：CPU、内存、磁盘、网络、并发数等资源限制。
+- 支持可观测性：结构化审计、分级日志、性能指标、调试模式。
 
 ### 1.2 非目标（Not now）
 
@@ -129,7 +133,7 @@ Agent Core 维护“运行态状态（Run State）”，用于让模型在多轮
 
 #### 4.3.1 Plan 生命周期：何时创建、何时更新
 
-Plan 的创建与更新依赖“提示词 + 结构化输出约束”来引导模型显式产出规划，并作为 Agent 的运行态状态保存。
+Plan 的创建与更新依赖"提示词 + 结构化输出约束"来引导模型显式产出规划，并作为 Agent 的运行态状态保存。
 
 - Plan 创建时机
   - `IndexSkills` 完成后进入第一次 `Decide`（第一次请求模型决策）时创建。
@@ -137,7 +141,7 @@ Plan 的创建与更新依赖“提示词 + 结构化输出约束”来引导模
 
 - Plan 更新时机
   - 每一轮 `Act` 执行完产生 `Observe` 后，进入下一次 `Decide`（下一次请求模型决策）时更新。
-  - `Observe` 本身不是一次对模型的请求，而是 Agent 执行工具/加载资源后的结果（observation）。更新发生在“把 observation 注入上下文后”的下一次模型调用里。
+  - `Observe` 本身不是一次对模型的请求，而是 Agent 执行工具/加载资源后的结果（observation）。更新发生在"把 observation 注入上下文后"的下一次模型调用里。
 
 - Plan 如何更新
   - 提示词要求模型基于：当前 Plan + 最新 observation + 预算约束，输出下一步结构化动作。
@@ -147,15 +151,75 @@ Plan 的创建与更新依赖“提示词 + 结构化输出约束”来引导模
     - 补充或修正 assumptions
     - 调整 constraints（例如预算压力下的降级策略）
 
-### 4.4 Skills 机制在 Agent Core 中的关键连接点
+### 4.3.2 Plan 持久化与恢复
+
+为支持长时运行任务与崩溃恢复，Plan 需要持久化：
+
+- 持久化时机
+  - 每次 Plan 更新后立即写入：`.agent/runs/<run-id>/plan.json`
+  - 同时记录当前轮次、已执行动作、观察结果摘要
+
+- 恢复机制
+  - Agent 启动时检查是否存在未完成的 run（状态非 `completed`/`failed`）
+  - 提供 `--resume <run-id>` 选项从上次断点恢复
+  - 恢复时重新加载：Plan、已加载技能、审计记录、上下文摘要
+
+- 清理策略
+  - 默认保留最近 N 次 run（例如 10 次）
+  - 提供 `runs clean` 命令手动清理
+
+### 4.4 上下文窗口管理策略
+
+技能正文、历史对话、观察结果可能超出模型token限制，需要智能管理：
+
+- 优先级分层
+  - P0：当前 Plan、最新观察、用户请求
+  - P1：已加载技能正文（摘要形式）
+  - P2：历史动作与观察（压缩摘要）
+  - P3：技能索引（可按相关性裁剪）
+
+- 裁剪策略
+  - 达到阈值（例如90% context window）时触发裁剪
+  - 按优先级逆序裁剪：先丢弃 P3，再压缩 P2
+  - 技能正文过长时提取关键段落（标题 + 步骤编号 + 自检清单）
+
+- 外部存储
+  - 长文本资源（>2000 tokens）不全量加载，仅存摘要+路径引用
+  - 提供 `recall_context` 动作让模型明确请求历史片段
+
+### 4.5 Skills 机制在 Agent Core 中的关键连接点
 
 1. 启动阶段只把技能元数据暴露给模型（渐进式披露 Level 1）。
 2. 模型通过 `select_skills` 选择技能后，Agent Core 才加载对应技能正文并注入上下文（Level 2）。
 3. 技能正文中的资源引用与脚本执行由模型通过 `load_resource/run_script` 明确请求，Agent Core 执行并把结果摘要注入上下文（Level 3）。
 4. Agent Core 在每次动作执行前后都执行：
    - 权限校验（全局配置 ∩ 技能 allowed-tools ∩ 运行时策略）
-   - 安全校验（路径越界、脚本超时、输出截断）
+   - 安全校验（路径越界、脚本超时、输出截断、资源配额）
    - 审计落盘（用于评估与回放）
+   - 上下文窗口检查与智能裁剪
+
+### 4.6 错误处理与容错机制
+
+Agent Core 需要稳健的错误处理策略，避免单点失败导致整体崩溃：
+
+- 模型调用失败
+  - 重试策略：指数退避，最多3次
+  - 降级策略：切换到备用模型（若配置）或提示用户
+  - 结构化输出解析失败时请求模型重新生成（附带错误提示）
+
+- 工具执行失败
+  - 脚本执行错误：捕获 stderr，作为观察注入上下文，允许模型调整计划
+  - 资源加载失败：记录错误，跳过该资源，继续执行
+  - 网络超时：可重试动作（如 `load_resource` from URL）
+
+- Plan 异常检测
+  - 死循环检测：连续N轮无进展（step状态不变）触发告警
+  - 预算耗尽：达到最大轮次/token时，强制要求模型输出 `final_answer`（附带未完成标记）
+  - 冲突检测：模型请求禁止工具时，记录违规并拒绝执行
+
+- 崩溃恢复
+  - 每轮结束后持久化 Run State（Plan + 审计 + 上下文摘要）
+  - 启动时检查未完成 run，提供恢复选项
 
 ```mermaid
 sequenceDiagram
@@ -187,13 +251,22 @@ sequenceDiagram
   A-->>U: response
 ```
 
-### 4.5 何时选择多技能与冲突处理（Agent 侧策略）
+### 4.7 何时选择多技能与冲突处理（Agent 侧策略）
 
 多技能允许同时选择，但 Agent Core 需要设定可控策略，避免一次性加载过多正文：
 
-- 默认策略：每轮最多加载 N 个技能正文（例如 1~2），以减少上下文污染。
-- 冲突策略：当模型选择同名技能但不同 source 时，按优先级选择；可允许模型显式指定 source。
-- 递进策略：先加载“协调型技能”（例如任务编排/规范），再加载“领域型技能”（例如 PDF/Excel）。
+- 默认策略：每轮最多加载 N 个技能正文（例如 2~3），基于上下文窗口动态调整。
+- 冲突策略：
+  - 同名技能但不同 source：按优先级选择（project > user > builtin）
+  - 允许模型显式指定 `source` 覆盖默认优先级
+  - 提供 `--prefer-source` CLI 选项全局设置偏好
+- 递进策略：
+  - 先加载"协调型技能"（例如任务编排/规范），再加载"领域型技能"（例如 PDF/Excel）
+  - 支持技能声明 `load-priority: high|normal|low` 影响加载顺序
+- 依赖处理：
+  - 技能可声明 `requires: [skill-name-1, skill-name-2]`
+  - Agent Core 自动检查依赖并按依赖顺序加载
+  - 循环依赖检测并拒绝加载
 
 详细策略将在 [Agent Core 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md) 展开。
 
@@ -201,7 +274,7 @@ sequenceDiagram
 
 详见：[Skill Registry 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-registry.md)、[Distribution & CLI 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/distribution-cli.md)。
 
-### 3.1 项目目录（建议）
+### 5.1 项目目录（建议）
 
 ```
 <repo>/
@@ -222,7 +295,7 @@ sequenceDiagram
 
 - `<repo>/skills_builtin/` 或随安装包资源内置
 
-### 3.2 Skill Root 搜索顺序（优先级）
+### 5.2 Skill Root 搜索顺序（优先级）
 
 默认优先级（高→低）：
 
@@ -236,7 +309,7 @@ sequenceDiagram
 - 提供 `--source project|user|builtin` 覆盖选择。
 - 允许命名空间：`org/skill-name`（可选增强）。
 
-### 3.3 配置文件（纯原生）
+### 5.3 配置文件（纯原生）
 
 优先选择 JSON（标准库原生支持）：
 
@@ -253,7 +326,7 @@ sequenceDiagram
 
 详见：[Skill Loader 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-loader.md)、[Skill Registry 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-registry.md)。
 
-### 4.1 YAML 前言字段（子集）
+### 6.1 YAML 前言字段（子集）
 
 必须字段：
 
@@ -262,19 +335,26 @@ sequenceDiagram
 
 常用可选字段（建议支持）：
 
-- `version: <string>`
-- `author: <string>`
+- `version: <string>`：技能版本（语义化版本，例如 `1.2.0`）
+- `author: <string>`：作者信息
 - `disable-model-invocation: <bool>`：从技能索引中隐藏（不允许模型自动触发）
 - `user-invocable: <bool>`：是否在 UI/CLI 列表展示为可直接调用
 - `allowed-tools: <list|string>`：允许工具白名单（如 `["read_file","grep","run_script"]`）
 - `run-mode: inline|subagent`：是否在子代理执行（可选增强）
+- `requires: <list>`：依赖的其他技能（例如 `["base-utils", "json-parser"]`）
+- `load-priority: high|normal|low`：加载优先级（默认 normal）
+- `resource-limits`：资源配额约束
+  - `max-script-time-sec: <int>`：单脚本最大执行时间（秒）
+  - `max-memory-mb: <int>`：最大内存使用（MB）
+  - `max-concurrent-scripts: <int>`：最大并发脚本数
+  - `allow-network: <bool>`：是否允许网络访问
 
 解析约束（安全）：
 
 - 前言区禁止 `<` `>`（降低高优先级注入风险）。
 - 仅支持标量与简单列表；复杂嵌套不解析或直接拒绝。
 
-### 4.2 正文结构建议（供技能作者）
+### 6.2 正文结构建议（供技能作者）
 
 为提升可执行性与评估性，建议技能正文至少包含：
 
@@ -289,7 +369,7 @@ sequenceDiagram
 
 详见：[Skill Loader 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-loader.md)、[Agent Core 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md)。
 
-### 5.1 启动阶段（Level 1：元数据常驻）
+### 7.1 启动阶段（Level 1：元数据常驻）
 
 - 扫描 skill roots，找到所有 `<skill-name>/SKILL.md`。
 - 仅解析 YAML 前言，提取 `name/description`（以及必要控制字段）。
@@ -303,7 +383,7 @@ sequenceDiagram
 
 向模型暴露的内容只包含“可用技能列表（name + description + source）”，不包含正文与资源。
 
-### 5.2 触发阶段（Level 2：加载正文）
+### 7.2 触发阶段（Level 2：加载正文）
 
 当模型选择某技能后：
 
@@ -313,7 +393,7 @@ sequenceDiagram
   - 可做轻量净化：移除不可见字符、规范化换行。
 - 将正文作为“技能说明”注入上下文，并带上技能来源与路径信息。
 
-### 5.3 执行阶段（Level 3：资源按需）
+### 7.3 执行阶段（Level 3：资源按需）
 
 当技能步骤需要更多细节时：
 
@@ -322,22 +402,22 @@ sequenceDiagram
   - 受控参数、受控工作目录、超时、输出截断、环境变量清理。
   - 仅把脚本输出（stdout/stderr 摘要）注入上下文。
 
-关键点：资源内容不应被无差别地全部读入上下文；以“精确文件+精确片段”为主。
+关键点：资源内容不应被无差别地全部读入上下文；以"精确文件+精确片段"为主。
 
 ## 8. 模型交互协议（结构化动作）（概要）
 
 详见：[Model Adapter 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/model-adapter.md)、[Agent Core 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md)。
 
-为保证可控、可评估、可回归，Agent 与模型之间使用“结构化动作输出协议”，模型不得直接输出自由形态的工具调用指令。
+为保证可控、可评估、可回归，Agent 与模型之间使用"结构化动作输出协议"，模型不得直接输出自由形态的工具调用指令。
 
-### 6.1 动作类型（建议最小集合）
+### 8.1 动作类型（建议最小集合）
 
 - `select_skills`：选择要加载的技能（可多选）
 - `load_resource`：读取技能资源文件（reference/assets）
 - `run_script`：执行技能脚本
 - `final_answer`：输出最终答复
 
-### 6.2 动作载荷（示例结构，非代码）
+### 8.2 动作载荷（示例结构，非代码）
 
 - `select_skills`:
   - `skills`: `[{"name": "...", "source": "project|user|builtin"}]`
