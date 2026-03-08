@@ -1,7 +1,7 @@
 """CLISink: real-time terminal output."""
 import sys
 from .sink import OutputSink
-from ..agent.plan import Plan, StepStatus
+from agent.plan import Plan, StepStatus
 
 # ANSI 颜色码
 _DIM    = "\033[2m"

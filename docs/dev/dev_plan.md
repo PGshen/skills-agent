@@ -109,14 +109,14 @@ A0.1（项目结构）
 | A1.4 | AgentState（Agent 状态）数据结构 | ✅ 已完成 | |
 | A1.5 | OutputSink 接口与 NullSink | ✅ 已完成 | |
 | A2.1 | SKILL.md Frontmatter 解析器 | ✅ 已完成 | |
-| A2.2 | Skill Registry（技能注册与索引） | ⬜ 待开始 | |
-| A2.3 | Skill Loader（技能内容加载器） | ⬜ 待开始 | |
-| A3.1 | MockModel | ⬜ 待开始 | |
-| A3.2 | ModelAdapter 接口 + 解析工具 | ⬜ 待开始 | |
-| A3.3 | Agent Core 主循环（ReAct） | ⬜ 待开始 | |
-| A4.1 | 基础 CLI | ⬜ 待开始 | |
-| A4.2 | CLISink（终端实时输出） | ⬜ 待开始 | |
-| A4.3 | Chat 会话模式 | ⬜ 待开始 | |
+| A2.2 | Skill Registry（技能注册与索引） | ✅ 已完成 | |
+| A2.3 | Skill Loader（技能内容加载器） | ✅ 已完成 | |
+| A3.1 | MockModel | ✅ 已完成 | |
+| A3.2 | ModelAdapter 接口 + 解析工具 | ✅ 已完成 | |
+| A3.3 | Agent Core 主循环（ReAct） | ✅ 已完成 | |
+| A4.1 | 基础 CLI | ✅ 已完成 | |
+| A4.2 | CLISink（终端实时输出） | ✅ 已完成 | |
+| A4.3 | Chat 会话模式 | ✅ 已完成 | |
 
 ### Phase B：脚本执行 + 权限 + 上下文裁剪
 

@@ -13,6 +13,7 @@ class AgentState(BaseModel):
 
     session_id: str
     user_input: str
+    status: str = "running"
     plan: Optional[Plan] = None
     active_skills: list[SkillMetadata] = Field(default_factory=list)
     turn_count: int = 0
@@ -22,6 +23,8 @@ class AgentState(BaseModel):
 
     def is_done(self) -> bool:
         if self.dead_loop_triggered:
+            return True
+        if self.status == "completed":
             return True
         if self.plan is None:
             return False

@@ -2,7 +2,7 @@
 import json
 from typing import Callable
 from .sink import OutputSink
-from ..agent.plan import Plan
+from agent.plan import Plan
 
 
 class SSESink(OutputSink):

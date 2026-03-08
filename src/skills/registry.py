@@ -32,6 +32,7 @@ class SkillRegistry:
             }
             for r in skill_roots
         ]
+
         self._index: list[SkillMetadata] = []
         self._scanned = False
 
