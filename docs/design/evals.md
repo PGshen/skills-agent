@@ -1,223 +1,177 @@
-# Evals 设计
+# Evals（评估与回归）设计
 
-本文档细化评估与回归（Evals）的设计：用例格式、判分规则（技能触发/动作序列/安全合规/输出质量/流式一致性）、以及报告产物（JSON/Markdown）。整体协作参见：[agent-core.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md)、[model-adapter.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/model-adapter.md)、[skill-registry.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-registry.md)、[skill-loader.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-loader.md)、[tools-runtime.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/tools-runtime.md)。
+**状态**：后续阶段，暂不实现
 
-## 1. 评估目标与原则
+> Phase A/B 通过 MockModel 驱动的端到端测试（pytest）验证链路正确性。
+> MockModel（按序列驱动 Agent 主循环）在 Phase A 实现，但仅用于骨架验证，不涉及本文档描述的评分与回归报告能力。
+> 本文档保留设计草案，供后续实现参考。
 
-### 1.1 评估目标
+---
 
-- 验证 Skills 机制是否按“标准完整实现”工作：渐进式披露、技能索引、按需加载、权限与审计、分发一致性
-- 验证 Agent Core 的 ReAct 主循环是否可控：一轮一动作、预算约束、失败降级、可回放
-- 验证 Model Adapter 的结构化输出是否稳定：JSON schema 合规、纠错重试、（可选）流式解析一致性
+## 1. 评估目标
 
-### 1.2 原则
+Evals 系统的目标是以**过程合规**（而非仅看最终文本）为一等指标，验证：
 
-- 以“过程合规”为一等指标：不仅看最终文本，还要看动作序列与安全策略是否正确
-- 测试必须可回放：以 `.agent/runs/<run_id>/events.jsonl` 为事实来源，评估从事件流重建执行过程
-- 分层评估：优先用 MockModel 离线验证执行链路，再引入真实模型做触发与输出质量评估
+| 验证维度 | 说明 |
+|----------|------|
+| 技能触发正确性 | 用户请求 → 正确的技能被选中 |
+| 动作序列合规 | `load_skill` 必须在 `run_script` 之前 |
+| 渐进式披露合规 | 未被选中的技能不应被加载 |
+| 权限与审批合规 | 禁止工具不得执行，审批流程必须正确 |
+| 预算合规 | turn/tool_call/script 数量不超限 |
+| 输出质量 | 最终答案包含期望内容 |
 
-## 2. 评估分层（Levels）
+**事实来源**：所有验证基于 `.agent/runs/<session_id>/events.jsonl`，不依赖主观判断。
 
-### 2.1 L0：纯单元（不跑 Agent）
+---
 
-验证纯函数与协议：
+## 2. 评估分层
 
-- frontmatter 解析与安全约束
-- 流式 JSON 解析器（路径回调、incremental delta）
-- 路径越界防护（skill loader/tools runtime）
+| 层级 | 名称 | 工具 | 说明 |
+|------|------|------|------|
+| L0 | 纯单元 | pytest | 纯函数：frontmatter 解析、路径校验、流式 JSON 解析 |
+| L1 | MockModel 端到端 | pytest + MockModel | 验证执行链路：状态机、接口、事件流格式 |
+| L2 | 真实模型（可选） | evals runner | 验证触发质量与输出稳定性 |
 
-### 2.2 L1：MockModel 端到端（推荐默认）
+Phase A/B 中 L0 + L1 已通过 pytest 覆盖。L2 在后续阶段实现。
 
-用例驱动 MockModel 输出动作序列，验证：
-
-- Agent Core 状态机与预算约束
-- Skill Registry/Loader/Tools Runtime 的接口与错误处理
-- 事件流与落盘格式是否符合回放需要
-
-### 2.3 L2：真实模型（可选）
-
-验证更接近线上真实行为：
-
-- 技能触发正确性（precision/recall）
-- 输出质量与格式稳定性
-- 结构化 JSON 合规率与重试成本
+---
 
 ## 3. 用例格式（Case Spec）
 
-每个用例是一个目录或一个 JSON/YAML 文件。建议以目录组织，便于携带输入文件与期望产物：
+每个用例一个目录：
 
 ```
 .agent/evals/<suite>/<case_id>/
-  case.json
-  inputs/
-  expected/
+  case.json      # 用例定义
+  inputs/        # 输入文件（可选）
+  expected/      # 期望产物（可选）
 ```
 
-### 3.1 case.json（建议字段）
+**case.json**：
 
 ```json
 {
   "id": "basic_select_skill",
-  "input": "请把这个PDF表单填好",
+  "description": "用户请求填写 PDF 表单，期望触发 pdf-form-filler 技能",
+  "input": "请把这个 PDF 表单填好",
   "setup": {
-    "skill_roots": ["./.agent/skills"],
-    "preinstall_skills": []
+    "skill_roots": [{"source": "project", "path": "tests/fixtures/skills", "priority": 0}]
+  },
+  "mock": {
+    "actions": [
+      {"type": "update_plan",   "params": {"plan": {"goal": "填写 PDF 表单", "steps": [{"id": "s1", "description": "加载技能", "status": "pending"}]}}},
+      {"type": "load_skill",    "params": {"skill_name": "pdf-form-filler"}},
+      {"type": "run_script",    "params": {"skill_name": "pdf-form-filler", "script": "scripts/fill.py", "args": []}},
+      {"type": "final_answer",  "params": {"content": "表单已填写完成"}}
+    ]
   },
   "expect": {
-    "skills_any_of": ["pdf-form-filler"],
-    "skills_all_of": [],
-    "action_sequence_constraints": [
-      {"must_occur": "select_skills", "before": "run_script"},
-      {"forbid": "write_file"}
+    "skills_all_of": ["pdf-form-filler"],
+    "action_sequence": [
+      {"must_occur": "load_skill", "before": "run_script"}
     ],
-    "output": {
-      "contains_any": ["已完成", "表单"],
-      "format": "markdown"
-    }
-  },
-  "constraints": {
-    "max_turns": 8,
-    "max_tool_calls": 15,
-    "deny_tools": ["network_request"]
+    "output_contains_any": ["表单", "完成"],
+    "budget": {"max_turns": 8, "max_tool_calls": 10}
   }
 }
 ```
 
-说明：
+---
 
-- `expect.skills_any_of / skills_all_of` 用于触发评估
-- `action_sequence_constraints` 用于过程合规评估
-- `constraints` 用于统一预算与安全约束（Agent Core/Tools Runtime 必须执行）
-
-### 3.2 允许用例指定 MockModel 输出（L1）
-
-为让 MockModel 可控，允许在用例中指定“预期动作脚本”：
-
-```json
-{
-  "mock": {
-    "turns": [
-      {"action": {"type": "select_skills", "payload": {"skills": [{"name": "pdf-form-filler", "source": "project"}]}}},
-      {"action": {"type": "run_script", "payload": {"skill": {"name": "pdf-form-filler", "source": "project"}, "relative_path": "scripts/fill.py", "args": []}}},
-      {"action": {"type": "final_answer", "payload": {"content": "done"}}}
-    ],
-    "streaming": {
-      "enabled": true,
-      "chunk_bytes": 12
-    }
-  }
-}
-```
-
-这用于验证：
-
-- 动作序列被正确执行
-- 流式 JSON chunk 被正确解析并回显
-
-## 4. 评分维度与判分规则
+## 4. 评分维度与规则
 
 ### 4.1 技能触发（Trigger）
 
-从事件流中提取 `select_skills` 动作的 skill name 列表，与用例期望比较：
+从 `events.jsonl` 提取所有 `SKILL_LOADED` 事件的 skill name 列表：
 
-- precision：选中的技能里有多少是期望技能
-- recall：期望技能里有多少被选中
+- `skills_all_of`：期望技能必须全部出现，否则 fail
+- `skills_any_of`：至少出现一个，否则 fail
+- `skills_none_of`：指定技能不得出现，出现则 fail
 
-判定建议：
+### 4.2 动作序列合规（Sequence）
 
-- `skills_all_of` 必须全部出现，否则 fail
-- `skills_any_of` 至少出现一个，否则 fail
+从事件流重建 Action 序列：
 
-### 4.2 动作序列合规（Sequence Compliance）
+```python
+# 约束示例：load_skill 必须在 run_script 之前
+constraints = [
+    {"must_occur": "load_skill", "before": "run_script"},
+    {"forbid": "write_file"},
+]
+```
 
-从 `events.jsonl` 重建动作序列，检查约束：
+### 4.3 预算合规（Budget）
 
-- 必须顺序：例如 `select_skills` 必须在 `load_resource/run_script` 之前
-- 一轮一动作：同一 turn 不得执行多个工具动作
-- 禁止动作：例如 forbid `write_file`、forbid `network_request`
+事件流统计：turn 数、tool_call 数、script 执行数，与 case.json 中的 `budget` 对比。
 
-### 4.3 渐进式披露合规（Progressive Disclosure）
+### 4.4 输出质量（Output）
 
-验证“只在需要时才加载”：
+从 `FINAL_ANSWER` 事件提取 `content` 字段：
 
-- 未触发技能不应出现 `load_skill_body` 事件（或等价证据）
-- 未请求资源不应出现 `load_resource` 事件
-- 事件中的加载报告应体现“受控输出”（truncated/sha256/storage_ref）
+- `output_contains_any`：至少含其中一个字符串
+- `output_contains_all`：必须全部包含
+- `output_regex`：正则匹配
 
-### 4.4 权限与审批合规（Security & Approval）
+### 4.5 渐进式披露合规
 
-验证 Tools Runtime 的关键策略：
+- 未被 `load_skill` 动作触发的技能不应出现 `SKILL_LOADED` 事件
+- 未被 `load_resource` 动作触发的资源不应出现读取记录
 
-- deny_tools 中的工具不得执行，出现则 fail
-- 需要审批的工具必须出现 `approval_required`，且只有 `approval_granted` 后才允许执行
-- 路径越界尝试必须被 `PathTraversalBlocked` 拦截
+---
 
-### 4.5 预算合规（Budget）
+## 5. 评估引擎接口（草案）
 
-- `max_turns/max_tool_calls/max_script_runs` 不得超限，超限则 fail
-- 当预算耗尽：必须产出降级输出，并在审计中标记 stop reason
+```python
+# src/evals/runner.py（后续实现）
+class EvalsRunner:
+    def run_case(self, case: dict) -> "EvalResult":
+        """
+        1. 用 case.mock.actions 构造 MockModel
+        2. 构造 AgentCore（注入 MockModel + NullSink）
+        3. 执行 AgentCore.run(case.input)
+        4. 读取生成的 events.jsonl
+        5. 按 case.expect 评分
+        6. 返回 EvalResult
+        """
+```
 
-### 4.6 输出质量（Output）
+---
 
-输出质量应按用例定义的“轻量可判定条件”评估，避免依赖主观判断：
+## 6. 报告格式（草案）
 
-- contains_any / contains_all
-- regex_match
-- structured 格式（例如必须是 markdown 或必须是 JSON）
-
-### 4.7 流式一致性（Streaming Consistency，可选）
-
-当启用 token 级流式解析：
-
-- delta 事件拼接后应等价于最终 `final_answer.content`
-- 流式回调不得引发提前执行 IO（必须在完整 JSON 校验后才执行动作）
-
-## 5. 评估输入来源：事件流与快照
-
-评估引擎以 run 目录为输入，至少需要：
-
-- `.agent/runs/<run_id>/events.jsonl`
-- （可选）`state.json`、`final.md`、`observations/*`
-
-原则：
-
-- events.jsonl 是事实来源
-- 大块输出通过 ref + hash 追溯，不要求全部进入事件 data
-
-## 6. 报告产物（Artifacts）
-
-### 6.1 JSON 报告（机器可读）
-
-建议输出：
+**JSON 报告（机器可读）**：
 
 ```json
 {
   "suite": "smoke",
   "case_id": "basic_select_skill",
-  "run_id": "20260203_123456_abcd",
   "pass": true,
   "scores": {
-    "trigger": {"precision": 1.0, "recall": 1.0},
+    "trigger":  {"pass": true,  "matched": ["pdf-form-filler"]},
     "sequence": {"pass": true},
-    "security": {"pass": true},
-    "budget": {"pass": true},
-    "output": {"pass": true}
+    "budget":   {"pass": true,  "turns": 4, "tool_calls": 2},
+    "output":   {"pass": true,  "matched": ["表单"]}
   },
-  "failures": [],
-  "stats": {"turns": 3, "tool_calls": 1}
+  "failures": []
 }
 ```
 
-### 6.2 Markdown 报告（人读）
+**Markdown 报告（人读）**：汇总通过率、失败用例列表、关键失败原因与事件行号引用。
 
-- 汇总通过率、失败用例列表
-- 展示关键失败原因与相关事件片段引用（event id / 行号范围）
+---
 
-## 7. MockModel 在评估中的定位
+## 7. 与现有测试的关系
 
-MockModel 是默认评估驱动器，目标不是模拟真实智能，而是提供：
+| 测试类型 | 位置 | 说明 |
+|----------|------|------|
+| L0 单元测试 | `tests/unit/` | 已在 Phase A 实现，覆盖所有公共接口 |
+| L1 端到端测试 | `tests/integration/` | 已在 Phase A 实现，MockModel 驱动 |
+| L2 Evals runner | `src/evals/` | 后续阶段，自动化评分报告 |
 
-- 可重复、可控的动作输出（用于验证执行链路）
-- 可选流式输出（用于验证 token 级体验链路）
+Phase A/B 的 pytest 覆盖 L0 + L1，已能验证大部分链路正确性。Evals runner 主要价值在于：
 
-真实模型评估（L2）应作为增量阶段，用于验证触发与输出质量，而不是基础链路正确性。
+1. 批量运行大量用例并生成结构化评分报告
+2. 真实模型触发质量评估（precision/recall）
+3. 回归测试：模型版本升级后验证行为不退化
+4. 流式一致性验证：delta 回调拼接结果与最终答案一致

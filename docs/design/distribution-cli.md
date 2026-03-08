@@ -1,216 +1,343 @@
-# Distribution & CLI 设计
+# CLI 设计
 
-本文档细化技能分发与命令行（Distribution & CLI）的设计：技能包格式、安装/卸载/校验、技能导出、索引刷新、以及与 Skill Registry 的一致性与可回放策略。整体协作参见：[skill-registry.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-registry.md)、[agent-core.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md) 与总览 [agent-skills-tech-design.md](file:///Users/peng/Me/Ai/skills-agent/docs/agent-skills-tech-design.md)。
+**状态**：Phase A（基础 CLI：run / chat / skills list/inspect）→ 后续阶段（技能包分发：zip 安装/卸载/校验）分阶段实现
 
-## 1. 系统定位与职责边界
+> **后续阶段（暂不实现）**：zip 包安装/卸载/签名校验等分发能力。当前阶段技能目录直接通过文件系统管理（手动复制 / git clone）。本文档 Phase A 部分为当前实现目标，后续部分保留设计草案供参考。
 
-Distribution & CLI 负责：
+---
 
-- 将技能以 zip 包形式分发与安装到指定 skill root
-- 提供命令行入口用于管理技能与运行评估（list/inspect/verify/install/uninstall/export/refresh）
-- 安装/卸载后触发 Skill Registry 刷新，保证索引一致性
-- 提供可审计输出（hash、manifest、日志）以支持安全审查与回放
+## 1. Phase A：基础 CLI
 
-不负责：
+### 1.1 命令概览
 
-- 技能正文/资源加载语义（由 Skill Loader）
-- 工具执行与审批（由 Tools Runtime）
-- 模型交互（由 Model Adapter）
+```
+skills-agent <command> [options]
 
-## 2. 目录与分发范围（Scopes）
+命令：
+  run <query>      单次模式：执行一次任务后退出
+  chat             会话模式：持续多轮对话
+  skills list      列出所有可用技能（技能索引）
+  skills inspect   查看指定技能的元数据
+```
 
-支持三类 skill roots（高→低优先级）：
+### 1.2 入口与路由
 
-1. 项目级：`<repo>/.agent/skills/`（可提交版本库）
-2. 用户级：`~/.agent/skills/`（跨项目复用）
-3. 内置级：安装包自带（只读）
+```python
+# src/cli/main.py
+import argparse
+import sys
 
-CLI 默认安装到用户级；提供 `--root` 或 `--scope project|user` 控制目标根目录。
+def main():
+    parser = argparse.ArgumentParser(
+        prog="skills-agent",
+        description="AI Agent with Skills system",
+    )
+    parser.add_argument("--config", default=".agent/config.json",
+                        help="Path to config file")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show observations and internal details")
+    parser.add_argument("--no-color", action="store_true",
+                        help="Disable colored output")
 
-## 3. 技能包格式（zip）
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-### 3.1 zip 内部结构
+    # run 子命令
+    run_parser = subparsers.add_parser("run", help="Execute a single query")
+    run_parser.add_argument("query", help="Query or task description")
+    run_parser.add_argument("--model", default=None,
+                            help="Override model provider")
 
-一个 zip 包可以包含多个技能目录：
+    # chat 子命令
+    chat_parser = subparsers.add_parser("chat", help="Start interactive chat session")
+    chat_parser.add_argument("--resume", default=None, metavar="SESSION_ID",
+                             help="Resume an existing session")
+    chat_parser.add_argument("--session-dir", default=".agent/sessions",
+                             help="Directory for session files")
+
+    # skills 子命令组
+    skills_parser = subparsers.add_parser("skills", help="Manage skills")
+    skills_sub = skills_parser.add_subparsers(dest="skills_command", required=True)
+    skills_sub.add_parser("list", help="List all available skills")
+    inspect_parser = skills_sub.add_parser("inspect", help="Inspect a specific skill")
+    inspect_parser.add_argument("name", help="Skill name")
+    inspect_parser.add_argument("--show-body", action="store_true",
+                                help="Also show skill body (SKILL.md content)")
+
+    args = parser.parse_args()
+
+    from ..common.config import load_config
+    config = load_config(args.config)
+
+    if args.command == "run":
+        from .run import run_command
+        run_command(args, config)
+    elif args.command == "chat":
+        from .chat import chat_command
+        chat_command(args, config)
+    elif args.command == "skills":
+        from .skills_cmd import skills_command
+        skills_command(args, config)
+```
+
+---
+
+### 1.3 `run` 命令
+
+```python
+# src/cli/run.py
+import sys
+from ..agent.core import AgentCore
+from ..output.cli_sink import CLISink
+from .builder import build_agent_core
+
+def run_command(args, config: dict) -> None:
+    """
+    单次执行模式。
+    进度 → stderr；最终答案 → stdout。
+    退出码：0=成功，1=失败/死循环。
+    """
+    sink = CLISink(verbose=args.verbose, color=not args.no_color)
+    core = build_agent_core(config, sink=sink)
+
+    try:
+        answer = core.run(args.query)
+        sys.exit(0)
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
+```
+
+### 1.4 `chat` 命令
+
+详见 [chat-session.md](chat-session.md)。
+
+```python
+# src/cli/chat.py
+import sys
+from ..session.session import SessionManager
+from ..session.compressor import ConversationCompressor
+from ..output.cli_sink import CLISink
+from .builder import build_agent_core
+
+def chat_command(args, config: dict) -> None:
+    """
+    交互式会话模式。主循环在 chat-session.md 第 8 节定义。
+    """
+    session_manager = SessionManager(sessions_root=args.session_dir)
+    sink = CLISink(verbose=args.verbose, color=not args.no_color)
+    core = build_agent_core(config, sink=sink)
+
+    # 加载或创建会话
+    if args.resume:
+        ctx = session_manager.load(args.resume)
+        if ctx is None:
+            print(f"Session '{args.resume}' not found.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Resuming session {ctx.session_id} (turn {ctx.total_turn_count})",
+              file=sys.stderr)
+    else:
+        ctx = session_manager.create(model_id=config.get("model", {}).get("provider", "mock"))
+        print(f"Session: {ctx.session_id}", file=sys.stderr)
+
+    compressor = ConversationCompressor(model=core._model)
+    print("Type 'exit' or Ctrl+C to quit.\n", file=sys.stderr)
+
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nGoodbye.", file=sys.stderr)
+            break
+
+        if not user_input or user_input.lower() in ("exit", "quit", "q"):
+            break
+
+        history = ctx.build_history_messages()
+        answer = core.run(user_input, history_messages=history)
+
+        ctx.record_turn(user_input, answer)
+        session_manager.append_log(ctx, user_input, answer)
+        compressor.maybe_compress(ctx)
+        session_manager.save(ctx)
+```
+
+### 1.5 `skills list` 与 `skills inspect`
+
+```python
+# src/cli/skills_cmd.py
+import json
+from ..skills.registry import SkillRegistry
+from ..skills.loader import SkillLoader
+
+def skills_command(args, config: dict) -> None:
+    registry = SkillRegistry(config["skill_roots"])
+    registry.scan()
+
+    if args.skills_command == "list":
+        skills = registry.all()
+        if not skills:
+            print("No skills found.")
+            return
+        print(f"Found {len(skills)} skill(s):\n")
+        for meta in sorted(skills, key=lambda m: (m.source, m.name)):
+            print(f"  [{meta.source}] {meta.name}")
+            print(f"    {meta.description}")
+
+    elif args.skills_command == "inspect":
+        meta = registry.find(args.name)
+        if not meta:
+            print(f"Skill '{args.name}' not found.")
+            return
+
+        print(f"Name:        {meta.name}")
+        print(f"Source:      {meta.source}")
+        print(f"Version:     {meta.version}")
+        print(f"Description: {meta.description}")
+        print(f"Path:        {meta.skill_path}")
+        print(f"Allowed tools: {meta.allowed_tools or '(none declared)'}")
+        print(f"Resource limits:")
+        print(f"  max_script_time_sec:  {meta.resource_limits.max_script_time_sec}")
+        print(f"  max_concurrent_scripts: {meta.resource_limits.max_concurrent_scripts}")
+        print(f"  allow_network:        {meta.resource_limits.allow_network}")
+
+        if args.show_body:
+            loader = SkillLoader()
+            body, report = loader.load_body(meta)
+            print(f"\n--- SKILL.md Body (sha256={report['sha256'][:8]}...) ---")
+            print(body)
+```
+
+### 1.6 AgentCore 构造辅助函数
+
+```python
+# src/cli/builder.py
+from ..agent.core import AgentCore
+from ..agent.events import EventLogger
+from ..skills.registry import SkillRegistry
+from ..skills.loader import SkillLoader
+from ..model.mock import MockModel
+from ..output.sink import OutputSink
+import os, uuid
+
+def build_agent_core(config: dict, sink: OutputSink = None) -> AgentCore:
+    """
+    根据配置构造 AgentCore。
+    当前仅支持 MockModel；Phase C 扩展为 AnthropicAdapter。
+    """
+    session_id = str(uuid.uuid4())
+    run_dir = f".agent/runs/{session_id}"
+    os.makedirs(run_dir, exist_ok=True)
+
+    event_logger = EventLogger(
+        path=f"{run_dir}/events.jsonl",
+        session_id=session_id,
+    )
+
+    registry = SkillRegistry(config.get("skill_roots", []))
+    loader = SkillLoader()
+
+    model_config = config.get("model", {})
+    provider = model_config.get("provider", "mock")
+
+    if provider == "mock":
+        # Phase A：MockModel 需要在测试中注入动作序列
+        # 实际 run 命令中：MockModel 使用空序列（立即返回 FINAL_ANSWER）
+        from ..model.mock import MockModel
+        from ..agent.plan import Action, ActionType
+        model = MockModel(actions=[
+            Action(type=ActionType.FINAL_ANSWER,
+                   params={"content": "[MockModel] No real model configured."})
+        ])
+    elif provider == "anthropic":
+        from ..model.anthropic import AnthropicAdapter
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        model = AnthropicAdapter(api_key=api_key, sink=sink)
+    else:
+        raise ValueError(f"Unknown model provider: {provider!r}")
+
+    budget = config.get("budget", {})
+
+    return AgentCore(
+        model=model,
+        registry=registry,
+        loader=loader,
+        event_logger=event_logger,
+        sink=sink,
+        max_turns=budget.get("max_turns", 20),
+    )
+```
+
+---
+
+## 2. CLI 使用示例
+
+```bash
+# 单次执行
+skills-agent run "分析 data.csv 并生成报告"
+
+# 单次执行，显示详细进度
+skills-agent run "填写表单" --verbose
+
+# 单次执行，重定向答案（进度仍显示在终端）
+skills-agent run "总结文档" > summary.md
+
+# 交互式会话
+skills-agent chat
+
+# 恢复已有会话
+skills-agent chat --resume <session-id>
+
+# 列出技能
+skills-agent skills list
+
+# 查看技能详情
+skills-agent skills inspect pdf-form-filler
+
+# 查看技能详情（含正文）
+skills-agent skills inspect pdf-form-filler --show-body
+```
+
+---
+
+## 3. 验收标准（Phase A）
+
+- [ ] `skills-agent run "test"` 正常运行，stdout 输出答案，stderr 输出进度
+- [ ] `skills-agent run "test" 2>/dev/null` 只有答案出现在 stdout
+- [ ] `skills-agent skills list` 正确列出测试 fixtures 中的技能
+- [ ] `skills-agent skills inspect example-skill` 输出正确元数据
+- [ ] `skills-agent chat` 启动后可连续输入，`exit` 正常退出
+- [ ] `--resume <invalid-id>` 输出错误提示并以非 0 退出码退出
+
+---
+
+## 4. 后续阶段：技能包分发（暂不实现）
+
+> 以下内容为后续增强的设计草案，Phase A 不实现。
+
+### 4.1 计划中的命令
+
+```bash
+skills-agent skills install <zip>     # 从 zip 包安装技能
+skills-agent skills uninstall <name>  # 卸载技能（移入 .trash）
+skills-agent skills verify <zip>      # 校验 zip 包完整性
+skills-agent skills export <name>     # 打包为 zip
+skills-agent skills refresh           # 强制刷新索引
+```
+
+### 4.2 技能包格式（zip）
 
 ```
 skills-pack.zip
-  <skill-dir-1>/
+  <skill-dir>/
     SKILL.md
     scripts/
     reference/
-    assets/
-  <skill-dir-2>/
-    SKILL.md
-    ...
+  manifest.json   （可选，包含文件哈希列表）
 ```
 
-约束：
+### 4.3 安装原则
 
-- 每个技能必须有 `SKILL.md`
-- 技能目录名不一定等于 `frontmatter.name`，但安装后目录名建议与 `name` 一致（见 4.3）
-- zip 内不得包含绝对路径与 `..` 路径段
-
-### 3.2 可选 manifest（增强）
-
-可选提供 `manifest.json`（推荐但非 MVP 必需）：
-
-```json
-{
-  "format_version": "1",
-  "skills": [
-    {"name": "pdf-form-filler", "version": "1.0.0", "dir": "pdf-form-filler"}
-  ],
-  "files": [
-    {"path": "pdf-form-filler/SKILL.md", "sha256": "..."}
-  ]
-}
-```
-
-作用：
-
-- 安装前完整性校验
-- 安装后可追溯（hash 对比）
-
-### 3.3 可选签名（增强）
-
-可选提供：
-
-- `skills-pack.zip.sig`
-- 或对 `manifest.json` 签名
-
-MVP 不强依赖加密签名，但 CLI 需要预留 `verify --signature ...` 的扩展点。
-
-## 4. 安装流程（Install）
-
-### 4.1 总体流程（原子 + 可回滚）
-
-```mermaid
-flowchart TB
-  A[zip input] --> B[extract to temp]
-  B --> C[validate structure]
-  C --> D[parse frontmatter]
-  D --> E[policy checks]
-  E --> F[stage to temp target]
-  F --> G[atomic move to skill root]
-  G --> H[refresh skill index]
-```
-
-### 4.2 校验与策略检查（必须）
-
-结构校验：
-
-- 每个技能目录存在 `SKILL.md`
-- zip 条目路径无越界（禁止 `..`、禁止绝对路径）
-
-前言校验（复用 Registry 的规则）：
-
-- `name`/`description` 必须存在
-- 前言禁止 `<` `>`，且大小受限
-- 复杂嵌套拒绝（仅子集解析）
-
-策略检查（建议）：
-
-- `allowed-tools` 若包含高风险工具，安装时警告或要求 `--allow-unsafe`
-- `disable-model-invocation` 可允许，但需提示该技能默认不会被模型自动触发
-
-### 4.3 目录命名与冲突处理
-
-安装到目标 root 时，目录名建议使用 `frontmatter.name`（而不是 zip 中的目录名），以保证一致性与可发现性：
-
-- 目标目录：`<skill_root>/<skill_name>/`
-- 如果目标已存在：
-  - 默认拒绝并提示 `--force` 或 `--backup`
-  - `--backup`：将原目录移动到 `<skill_root>/.backup/<skill_name>/<timestamp>/`
-  - `--force`：覆盖安装（仍建议先备份）
-
-### 4.4 原子移动与失败回滚
-
-安装必须保证要么成功要么不改变现状：
-
-- 解压与校验在临时目录完成
-- 通过后移动到 `<skill_root>/.staging/<skill_name>_<run_id>/`
-- 最后一步用原子 rename/move 替换目标目录
-- 失败则清理 staging，并保留错误报告
-
-### 4.5 安装后动作
-
-- 触发 Skill Registry 刷新
-- 输出安装报告：
-  - 安装技能列表（name/source/path）
-  - 冲突与覆盖信息
-  - hash（至少对 SKILL.md 输出 sha256）
-
-## 5. 卸载流程（Uninstall）
-
-卸载命令按 name + scope/source 定位：
-
-- `skills uninstall <name> --scope user|project`
-
-默认策略：
-
-- 不直接删除：移动到 `<skill_root>/.trash/<name>/<timestamp>/`（可配置）
-- 可加 `--purge` 直接删除（高风险，建议审批或二次确认）
-
-卸载后：
-
-- 触发 Skill Registry 刷新
-- 输出卸载报告（含备份/回收路径）
-
-## 6. 校验（Verify）
-
-### 6.1 安装包校验
-
-`skills verify-pack <zip>`：
-
-- 结构与前言校验
-- 输出 `manifest`（若 zip 未提供则生成临时 manifest）
-- 输出关键文件哈希（至少 SKILL.md）
-
-### 6.2 已安装技能校验
-
-`skills verify <name>`：
-
-- 校验技能目录结构完整性
-- 校验 SKILL.md 前言可解析
-- 输出文件哈希摘要（用于人工审计与 diff）
-
-## 7. 导出（Export）
-
-`skills export <name> --out <zip>`：
-
-- 从指定 root 打包该技能目录
-- 可选择生成 `manifest.json`
-- 可选择生成签名（后续增强）
-
-## 8. 列表与查看（List/Inspect）
-
-与 Skill Registry 对齐：
-
-- `skills list`：展示 Skill Index（name/description/source）
-- `skills inspect <name>`：展示该技能的元数据（含 controls/meta）与路径
-
-注意：inspect 默认不打印正文，避免无意中泄露敏感内容；可加 `--show-body` 显式展示（仍受输出限制）。
-
-## 9. 与 Skill Registry 的一致性策略
-
-安装/卸载/导出操作必须与 Registry 的索引规则一致，避免“安装后找不到”的情况：
-
-- 安装时使用同一套 frontmatter 校验与 name 解析规则
-- 安装后立即 refresh index，并输出 index hash（供回放与审计）
-
-## 10. 审计与落盘协作
-
-Distribution & CLI 的输出建议支持两种模式：
-
-- 人读：控制台摘要
-- 机读：JSON 报告（可写入 `.agent/runs/<run_id>/events.jsonl` 或单独产出）
-
-关键审计字段：
-
-- 操作类型（install/uninstall/verify/export）
-- 目标 root/source
-- 技能列表与版本信息（如有）
-- 文件哈希（sha256）
-- 冲突处理（是否覆盖、备份路径）
-- 失败原因（含被拒绝的路径条目与校验错误）
+- 解压到临时目录 → 完整性校验 → 原子移动到 skill root
+- 冲突处理：默认拒绝，支持 `--force` 覆盖
+- 安装后触发 SkillRegistry 刷新
+- 卸载：移入 `.trash/`（不直接删除，支持恢复）

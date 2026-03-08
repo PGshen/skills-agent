@@ -1,244 +1,466 @@
 # Model Adapter 设计
 
-本文档细化模型适配层：统一接口、结构化动作输出协议、解析与重试策略、流式（token 级）结构化输出、以及 MockModel 的实现要求。整体协作见：[agent-core.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md)。
+**状态**：Phase A（MockModel）→ Phase C（AnthropicAdapter + StreamingJSONParser）分阶段实现
 
-## 1. 目标与边界
+---
 
-### 1.1 目标
+## 1. 设计目标
 
-- 不绑定供应商：可适配 OpenAI-compatible/Anthropic/本地模型
-- 强制结构化动作输出：每轮 `Decide` 产出可校验 JSON（动作 + 可选 plan_update）
-- 支持鲁棒解析：容忍噪声、提供纠错与重试、可降级
-- 支持 token 级流式体验：在保持结构化 JSON 的前提下增量解析并触发回调
-- 支持审计与评估：输出可被 Agent Core 落盘回放的关键摘要/哈希
+Model Adapter 是模型 I/O 可靠性层，将上层固定格式的消息（messages）转换为结构化 Action 输出。
 
-### 1.2 边界（不做什么）
+| 要求 | 说明 |
+|------|------|
+| 供应商无关 | 可切换 MockModel / Anthropic / OpenAI-compatible |
+| 强制结构化输出 | 每轮 `next_action()` 必须返回一个合法 Action |
+| 鲁棒解析 | 容忍模型输出噪声（code fence、解释文本），提供重试 |
+| 流式支持 | Phase C 支持 token 级流式输出（StreamingJSONParser + OutputSink）|
+| 评估支持 | MockModel 支持用例驱动的动作序列，支持流式模拟 |
 
-- 不做技能扫描/加载：由 Skill Registry / Skill Loader 负责
-- 不做工具执行/权限：由 Tools Runtime 负责
-- 不做业务规划策略：Plan 的更新语义由 Agent Core 决定
+**不在此处理**：
+- 技能发现与加载（Skill Registry / Skill Loader 负责）
+- 工具执行与权限（Tools Runtime 负责）
+- Plan 更新语义（Agent Core 决定）
 
-## 2. 系统定位（中枢协作）
+---
 
-Model Adapter 是“模型 I/O 可靠性层”，把上层固定格式的上下文输入（messages + 预算 + schema 契约）转换为“本轮唯一动作”的结构化 JSON 输出。
+## 2. 统一接口
 
-```mermaid
-flowchart LR
-  A[Agent Core] -->|DecideRequest| B[Model Adapter]
-  B -->|HTTP/SSE| C[(Model Provider)]
-  C -->|chunks or text| B
-  B -->|DecideResult| A
+```python
+# src/model/base.py
+from abc import ABC, abstractmethod
+from ..agent.plan import Action
+
+class ModelAdapter(ABC):
+    """
+    模型适配器抽象基类。
+    Agent Core 仅依赖此接口，不依赖具体实现。
+    """
+
+    @abstractmethod
+    def next_action(self, messages: list[dict]) -> Action:
+        """
+        向模型发送 messages，解析并返回单个 Action。
+
+        messages 格式：OpenAI 风格 [{"role": str, "content": str}, ...]
+        返回：Action（type + params）
+
+        失败时抛出 ModelResponseError（Agent Core 捕获并记录为 observation）。
+        """
+
+    def close(self) -> None:
+        """释放资源（连接池等），默认空实现。"""
 ```
 
-## 3. 统一接口（非代码约定）
+---
 
-### 3.1 非流式接口
+## 3. MockModel（Phase A/B）
 
-- 输入：`DecideRequest`
-- 输出：`DecideResult`（包含 `action`、可选 `plan_update`、可选 `diagnostics`）
+### 3.1 设计目标
 
-### 3.2 流式接口
+- 用于 Phase A/B 端到端测试，无需真实 API
+- 按用例预设动作序列，按轮次依次返回
+- 支持模拟流式输出（Phase A 测试流式 JSON 解析链路）
 
-- 输入：`DecideRequest` + 回调注册（可选）
-- 输出：同样必须在流结束时产出 `DecideResult`
-- 过程：边接收 chunk 边解析，并在命中关键路径时触发回调（用于 token 级回显）
+### 3.2 完整实现
 
-语义约束：
+```python
+# src/model/mock.py
+from .base import ModelAdapter
+from ..agent.plan import Action, ActionType
 
-- 每轮 `Decide` 最终必须完成一次“完整 JSON 校验”；流式回调只用于体验，不可绕过校验
-- 每轮必须输出一个动作（one action per turn）
+class MockModel(ModelAdapter):
+    """
+    按顺序返回预设 Action 序列。
+    用于单元测试与 Phase A/B 端到端验证。
+    当序列耗尽时返回 FINAL_ANSWER（避免死循环）。
+    """
 
-### 3.3 DecideRequest（建议字段）
+    def __init__(self, actions: list[Action | dict]):
+        """
+        actions: 预设动作列表。
+        每项可以是 Action 对象或 dict（自动转换）。
+        示例：
+            MockModel([
+                Action(type=ActionType.UPDATE_PLAN, params={"plan": {...}}),
+                Action(type=ActionType.LOAD_SKILL, params={"skill_name": "data-analysis"}),
+                Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+            ])
+        """
+        self._actions: list[Action] = []
+        for a in actions:
+            if isinstance(a, dict):
+                self._actions.append(Action.model_validate(a))
+            else:
+                self._actions.append(a)
+        self._index = 0
+        self._call_history: list[list[dict]] = []
 
-- `messages`：OpenAI 风格 messages（system/developer/user/assistant）
-- `schema_hint`：输出 JSON schema 的文本化契约（固定模板）
-- `budget`：如 `max_output_chars`、`max_retries`、`allow_streaming`
-- `telemetry`：如 `run_id`、`turn`（用于审计关联）
+    def next_action(self, messages: list[dict]) -> Action:
+        self._call_history.append(messages)
 
-### 3.4 DecideResult（建议字段）
+        if self._index >= len(self._actions):
+            # 序列耗尽，返回 final_answer 防止死循环
+            return Action(
+                type=ActionType.FINAL_ANSWER,
+                params={"content": "[MockModel: action sequence exhausted]"},
+            )
+
+        action = self._actions[self._index]
+        self._index += 1
+        return action
+
+    @property
+    def call_count(self) -> int:
+        return len(self._call_history)
+
+    def reset(self) -> None:
+        self._index = 0
+        self._call_history.clear()
+```
+
+### 3.3 流式模拟（Phase C 测试用）
+
+```python
+class StreamingMockModel(MockModel):
+    """
+    继承 MockModel，在 next_action 中模拟流式 chunk 输出。
+    用于验证 StreamingJSONParser + CLISink 的流式链路。
+    """
+
+    def __init__(self, actions: list[Action | dict], chunk_size: int = 10):
+        super().__init__(actions)
+        self._chunk_size = chunk_size
+
+    def next_action_streaming(
+        self,
+        messages: list[dict],
+        on_chunk,  # Callable[[str], None]
+    ) -> Action:
+        """
+        模拟 token 级流式输出：将 JSON 字符串按 chunk_size 分块调用 on_chunk。
+        """
+        import json
+        action = super().next_action(messages)
+        json_str = json.dumps({"type": action.type, "params": action.params})
+
+        for i in range(0, len(json_str), self._chunk_size):
+            on_chunk(json_str[i:i + self._chunk_size])
+
+        return action
+```
+
+---
+
+## 4. 结构化动作协议
+
+### 4.1 模型输出格式
+
+每次 `next_action()` 期望模型输出单个 JSON 对象（不含 Markdown code fence 或解释文本）：
 
 ```json
 {
-  "action": {"type": "select_skills", "payload": {}},
-  "plan_update": null,
-  "diagnostics": null,
-  "raw": {"hash": "...", "size": 1234}
+  "type": "load_skill",
+  "params": {
+    "skill_name": "pdf-form-filler"
+  }
 }
 ```
 
-## 4. 结构化动作协议（与整体设计对齐）
+### 4.2 Action.type 枚举与 params 结构
 
-### 4.1 顶层结构（统一 schema）
+| type | 必需 params | 可选 params |
+|------|-------------|-------------|
+| `load_skill` | `skill_name: str` | — |
+| `load_resource` | `skill_name: str`, `resource: str` | `section_hint: str` |
+| `run_script` | `skill_name: str`, `script: str` | `args: list[str]` |
+| `update_plan` | `plan: dict`（完整 Plan JSON） | — |
+| `final_answer` | `content: str` | — |
 
-每次 `Decide` 的模型输出必须是单个 JSON 对象，不得包含 code fence 或解释性文本：
+`update_plan` 中的 plan 格式：
 
 ```json
 {
-  "action": {"type": "select_skills", "payload": {}},
-  "plan_update": null,
-  "diagnostics": null
+  "goal": "完成用户任务",
+  "steps": [
+    {"id": "s1", "description": "加载数据分析技能", "status": "pending"},
+    {"id": "s2", "description": "执行分析脚本",     "status": "pending"},
+    {"id": "s3", "description": "输出报告",          "status": "pending"}
+  ]
 }
 ```
 
-### 4.2 action.type 枚举
+### 4.3 System Prompt 中的输出协议约束
 
-- `select_skills`
-- `load_resource`
-- `run_script`
-- `final_answer`
-
-### 4.3 action.payload（概要）
-
-`select_skills`：
-
-```json
+```
+## 输出格式（严格遵守）
+每次回复必须且只能是以下格式的 JSON 对象：
 {
-  "skills": [{"name": "pdf-form-filler", "source": "project"}],
-  "reason": "..."
+  "type": "<动作类型>",
+  "params": { ... }
 }
+
+禁止：
+- Markdown code fence（```json）
+- 解释文字、前言、结尾说明
+- 多个 JSON 对象
+- 嵌套 action 数组
 ```
 
-`load_resource`：
+---
 
-```json
-{
-  "skill": {"name": "pdf-form-filler", "source": "project"},
-  "relative_path": "reference/kpi.md",
-  "section_hint": "## 指标定义"
-}
+## 5. 解析、校验与重试
+
+### 5.1 解析策略（Phase A，非流式）
+
+```python
+# src/model/base.py（工具函数）
+import json, re
+
+def parse_action_response(raw: str) -> Action:
+    """
+    从模型原始文本解析 Action。
+    三步降级解析：
+    1. 直接 json.loads()
+    2. 提取最外层 {} 块再解析（去除 code fence 等噪声）
+    3. 仍失败则抛出 ModelResponseError
+    """
+    raw = raw.strip()
+
+    # 步骤 1：直接解析
+    try:
+        data = json.loads(raw)
+        return _validate_action(data)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 步骤 2：提取 JSON 块
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group())
+            return _validate_action(data)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    raise ModelResponseError(f"Cannot parse model response as Action: {raw[:200]!r}")
+
+def _validate_action(data: dict) -> Action:
+    """最小 schema 校验：type 必须是合法枚举，params 必须是 dict。"""
+    if "type" not in data:
+        raise ValueError("Missing 'type' field")
+    return Action(type=data["type"], params=data.get("params", {}))
 ```
 
-`run_script`：
+### 5.2 重试策略
 
-```json
-{
-  "skill": {"name": "pdf-form-filler", "source": "project"},
-  "relative_path": "scripts/fill.py",
-  "args": ["--input", "data.json"]
-}
+```python
+class RetryAdapter(ModelAdapter):
+    """
+    包装任意 ModelAdapter，在解析失败时自动重试。
+    重试时附加纠错消息（要求模型仅输出修正 JSON）。
+    """
+
+    def __init__(self, inner: ModelAdapter, max_retries: int = 2):
+        self._inner = inner
+        self._max_retries = max_retries
+
+    def next_action(self, messages: list[dict]) -> Action:
+        last_error = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                return self._inner.next_action(messages)
+            except ModelResponseError as e:
+                last_error = e
+                if attempt < self._max_retries:
+                    # 追加纠错消息
+                    messages = messages + [{
+                        "role": "user",
+                        "content": (
+                            f"你的上一次输出无法解析：{e}\n"
+                            "请仅输出一个合法的 JSON 对象，格式：\n"
+                            '{"type": "<动作类型>", "params": {...}}'
+                        )
+                    }]
+        raise last_error
+
+class ModelResponseError(Exception):
+    pass
 ```
 
-`final_answer`：
+---
 
-```json
-{
-  "content": "..."
-}
+## 6. AnthropicAdapter（Phase C）
+
+### 6.1 接口草图
+
+```python
+# src/model/anthropic.py
+import anthropic
+from .base import ModelAdapter
+from ..agent.plan import Action
+from ..output.sink import OutputSink, NullSink
+from .streaming import StreamingJSONParser
+
+class AnthropicAdapter(ModelAdapter):
+    """
+    Anthropic Claude API 适配器（Phase C）。
+    支持非流式与流式两种调用模式。
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "claude-sonnet-4-6",
+        max_tokens: int = 4096,
+        sink: OutputSink = None,
+    ):
+        self._client = anthropic.Anthropic(api_key=api_key)
+        self._model = model
+        self._max_tokens = max_tokens
+        self._sink = sink or NullSink()
+
+    def next_action(self, messages: list[dict]) -> Action:
+        """非流式调用（Phase C 初期）。"""
+        system_msg = None
+        user_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                system_msg = m["content"]
+            else:
+                user_messages.append(m)
+
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            system=system_msg or "",
+            messages=user_messages,
+        )
+        raw = response.content[0].text
+        action = parse_action_response(raw)
+
+        # Phase A 行为：FINAL_ANSWER 时一次性调用 on_text_chunk
+        if action.type == "final_answer":
+            self._sink.on_text_chunk(action.params.get("content", ""), done=True)
+
+        return action
+
+    def next_action_streaming(self, messages: list[dict]) -> Action:
+        """
+        流式调用（Phase C 完整版）。
+        通过 StreamingJSONParser 实时解析 token，
+        在解析到 final_answer.content 时逐字调用 sink.on_text_chunk()。
+        """
+        # 详见 streaming.md 设计
+        ...
 ```
 
-Model Adapter 的最小校验只保证“能被 Agent Core 接收并进入 Guardrails”；路径越界、技能是否存在、工具权限等由 Agent Core / Tools Runtime 负责。
+---
 
-### 4.4 plan_update（结构保证，不解释语义）
+## 7. StreamingJSONParser（Phase C）
 
-plan_update 允许两种形式：
+### 7.1 设计要点
 
-- replace：输出完整 plan
-- patch：输出 ops 列表
+StreamingJSONParser 是自研的 FSM（有限状态机）流式 JSON 解析器，不依赖第三方库。
 
-```json
-{
-  "mode": "patch",
-  "ops": [{"op": "set", "path": "/steps/s2/status", "value": "in_progress"}]
-}
+```
+输入：JSON 字符流（逐字符或逐 chunk）
+输出：路径匹配回调（JSONPath 风格）
+
+支持路径：
+  $.type                        → 解析到 action.type 时回调
+  $.params.content              → 解析到 final_answer.content 时逐字回调（delta 模式）
+  $.params.skill_name           → 解析到 skill_name 时回调
 ```
 
-## 5. 提示词契约（Decide Prompt Contract）
+### 7.2 接口草图
 
-### 5.1 强约束模板（要点）
+```python
+# src/model/streaming.py
+from typing import Callable
 
-每次 Decide 的提示词必须包含：
+class StreamingJSONParser:
+    """
+    FSM 流式 JSON 解析器。
+    path_callbacks: 路径 → 回调函数映射。
+    回调签名：(path: str, value: str, done: bool) -> None
+    """
 
-- 只能输出一个 JSON 对象
-- 不允许输出 Markdown、解释、前后缀文本
-- 必须包含 `action.type` 与 `action.payload`
-- 本轮只能输出一个动作（后续动作通过下一轮 Decide 实现）
+    def __init__(
+        self,
+        path_callbacks: dict[str, Callable[[str, str, bool], None]],
+    ):
+        self._callbacks = path_callbacks
+        # FSM 内部状态...
 
-### 5.2 与 Skills 渐进披露对齐
+    def feed(self, chunk: str) -> None:
+        """接收一个字符串 chunk，更新状态机，触发命中的回调。"""
 
-提示词需要与 Agent Core 的上下文分区对齐：
+    def get_result(self) -> dict:
+        """流结束后返回完整的 JSON 对象（用于最终校验）。"""
 
-- 当仅提供 skills index（Level 1）时：模型应先选择技能而不是假设技能正文内容
-- 当已加载技能正文（Level 2）时：模型可按技能流程请求资源或执行脚本
-- 当 observation 进入上下文（Level 3）时：模型应基于 observation 更新计划并决定下一动作
+    def reset(self) -> None:
+        """重置状态机（新一轮调用前使用）。"""
+```
 
-## 6. 解析、校验与重试
+### 7.3 与 CLISink 的集成（Phase C）
 
-### 6.1 解析策略（优先级）
+```python
+def on_answer_chunk(path: str, value: str, done: bool) -> None:
+    self._sink.on_text_chunk(value, done)
 
-1. 直接解析整体输出为 JSON
-2. 若包含噪声文本：提取最外层 JSON 对象再解析
-3. 仍失败：触发纠错重试（要求“仅输出修正后的 JSON”）
+parser = StreamingJSONParser(callbacks={
+    "$.params.content": on_answer_chunk,
+})
 
-### 6.2 最小 schema 校验
+with self._client.messages.stream(...) as stream:
+    for chunk in stream.text_stream:
+        parser.feed(chunk)
 
-- `action` 必须是 object
-- `action.type` 必须是枚举之一
-- `action.payload` 必须是 object
+result = parser.get_result()
+return _validate_action(result)
+```
 
-### 6.3 纠错与重试策略
+---
 
-- 第一次失败：返回明确错误原因 + 期望 schema，要求模型仅输出修正 JSON
-- 第二次失败：允许降级为 `final_answer`（结构化输出“无法继续”的原因与建议）
+## 8. 各阶段实现范围
 
-所有重试必须计入预算，并把错误原因、重试次数、输出哈希落盘（由 Agent Core 记录）。
+| 功能 | Phase A | Phase B | Phase C |
+|------|---------|---------|---------|
+| ModelAdapter 抽象基类 | ✅ | — | — |
+| MockModel（顺序动作） | ✅ | — | — |
+| parse_action_response（JSON 解析 + 提取） | ✅ | — | — |
+| RetryAdapter（重试包装） | ✅ | — | — |
+| AnthropicAdapter（非流式） | — | — | ✅ |
+| StreamingJSONParser | — | — | ✅ |
+| AnthropicAdapter（流式） | — | — | ✅ |
+| StreamingMockModel（流式测试） | — | — | ✅ |
 
-## 7. Token 级流式：结构化 JSON 的流式解析
+---
 
-### 7.1 为什么可行
+## 9. 验收标准
 
-整体设计要求“每轮交互 JSON schema 固定”，因此可以在模型输出过程中就解析出关键路径并实时回显，同时保证最终仍能得到一个可校验的完整 JSON 对象。
+### Phase A
 
-### 7.2 解析器能力要求
+- [ ] `MockModel` 按序返回 3 个预设 Action，第 4 次返回 FINAL_ANSWER
+- [ ] `parse_action_response()` 正确解析干净 JSON
+- [ ] `parse_action_response()` 正确从带 code fence 的输出中提取 JSON
+- [ ] `RetryAdapter` 在第一次失败后追加纠错消息并重试
+- [ ] `MockModel.call_count` 在 AgentCore 完成 3 轮后等于 3
 
-- 输入：chunk 字符流（SSE data 或 HTTP chunked body）
-- 解析：逐字符有限状态机，维护 stack（对象/数组/根值）与 path（属性名/数组索引）
-- 匹配：路径匹配支持精确/通配符 `*`
-- 回调模式：
-  - realtime：解析过程中立即回调
-  - incremental：对字符串字段只回调新增部分（delta），避免重复回传完整值
+### Phase C
 
-### 7.3 路径回调建议（用于事件流）
+- [ ] `AnthropicAdapter.next_action()` 成功调用 API 并返回合法 Action
+- [ ] `StreamingJSONParser` 对 `$.params.content` 路径触发多次 delta 回调
+- [ ] delta 回调拼接结果与最终 `get_result()["params"]["content"]` 一致
+- [ ] 流式中断时（网络错误）抛出 `ModelResponseError`，不挂起
 
-- `$.action.type`
-- `$.action.payload.skills[*].name`、`$.action.payload.skills[*].source`
-- `$.action.payload.content`（当 `action.type == final_answer`，作为 token/delta 输出）
-- `$.plan_update`（可选）
+---
 
-### 7.4 失败回退
+## 10. 设计权衡说明
 
-- JSON 不闭合或最终校验失败：本轮 Decide 失败，交给 Agent Core 走“重试/降级”策略
-- 流式回调与最终对象不一致：以最终校验通过的对象为准，回调仅用于体验
-
-## 8. 供应商适配（纯原生实现约束）
-
-在 Python 纯原生约束下，建议使用标准库 HTTP 客户端实现：
-
-- OpenAI-compatible：按配置对接 chat completions / responses
-- Anthropic：按 messages 接口对接（如启用）
-- Local：对接自建 HTTP endpoint
-
-适配层需要把“传输层格式差异”规整为：
-
-- 非流式：一次性完整文本
-- 流式：统一的 chunk 迭代器（字符/字节）
-
-## 9. 安全与隐私（与审计协同）
-
-- 默认不记录完整 prompt 与完整模型输出；只记录必要字段、摘要与哈希
-- 流式 delta 事件对外可见，但落盘可只存摘要/哈希并把原文交给客户端会话层保留
-- 若启用开发调试落原文，必须显式配置开启
-
-## 10. MockModel（评估与回归依赖）
-
-### 10.1 目标
-
-- 用例驱动输出动作序列
-- 支持 evals 离线回归
-- 能模拟流式输出，用于验证“流式 JSON 解析 + token 级回显”链路
-
-### 10.2 流式模拟
-
-- 非流式：直接返回完整 JSON
-- 流式：将同一 JSON 拆分为多个 chunk（可按固定字符数、或按字段边界拆分），并确保：
-  - 回调可命中关键路径（例如 `$.action.type`、`$.action.payload.content`）
-  - 流结束后仍能重建出与非流式一致的完整 JSON 对象
+| 决策点 | 选择 | 替代方案 | 选择理由 |
+|--------|------|----------|----------|
+| 结构化输出机制 | prompt-only（要求 JSON 输出） | tool use / JSON mode | MockModel 阶段不依赖 provider 能力；Phase C 可切换为 tool use |
+| 流式解析器 | 自研 FSM | 第三方库（ijson 等） | 避免依赖；场景简单（固定 schema）；可测试性强 |
+| MockModel 序列耗尽处理 | 返回 FINAL_ANSWER | 抛出异常 | 避免测试因 MockModel 逻辑导致死循环 |
+| 重试时追加 user 消息 | 追加到 messages 末尾 | 新开对话 | 给模型更多上下文理解失败原因 |

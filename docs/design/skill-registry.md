@@ -1,199 +1,329 @@
 # Skill Registry 设计
 
-本文档细化 Skill Registry（技能注册表）的设计：多根目录扫描、元数据解析（YAML 前言子集）、冲突解决、缓存与刷新策略，以及暴露给 Agent/模型的技能索引格式。整体协作参见：[agent-core.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md) 与总览 [agent-skills-tech-design.md](file:///Users/peng/Me/Ai/skills-agent/docs/agent-skills-tech-design.md)。
+**状态**：Phase A 完整实现
 
-## 1. 系统定位与职责边界
+---
 
-Skill Registry 的核心职责是：在 Agent 启动或按需刷新时，扫描多个 skill root，构建“仅元数据”的技能索引（Skill Index），供 Agent Core 在 Level 1 渐进披露阶段提供给模型选择。
+## 1. 设计目标
 
-必须保证：
+Skill Registry 是技能发现层，在 Agent 启动时扫描多个 skill root，构建"仅元数据"的技能索引（Skill Index），供 Agent Core 注入给模型使用（渐进式披露 Level 1）。
 
-- 只解析 YAML 前言（name/description 等），不读取 SKILL.md 正文
-- 可发现多来源技能（项目级/用户级/内置级），并提供稳定的冲突解决策略
-- 输出稳定、可缓存、可审计（索引结果可落盘/可追溯）
+**核心职责**：
+- 扫描多根目录，发现所有合法 SKILL.md
+- 解析 YAML 前言（PyYAML safe_load），构建 SkillMetadata 列表
+- 处理同名技能冲突（高优先级 source 胜出）
+- 提供 `find()` 接口供 Agent Core 按名称查询技能
 
-不在 Skill Registry 内处理：
+**不在此处理**：
+- 读取 SKILL.md 正文（Skill Loader 负责）
+- 工具执行与权限（Tools Runtime 负责）
+- 模型通信（Model Adapter 负责）
 
-- 读取技能正文与资源文件（由 Skill Loader 负责）
-- 工具执行、权限合并与审批（由 Tools Runtime / Agent Core 负责）
-- 模型交互与结构化动作解析（由 Model Adapter 负责）
+---
 
-## 2. 输入输出与接口契约（非代码约定）
+## 2. 数据流
 
-### 2.1 输入：Skill Roots
+```
+skill_roots（配置中的目录列表）
+    │
+    ▼
+[SkillRegistry.scan()]
+    │
+    ├── 遍历每个 root 目录
+    ├── 发现 <root>/<skill_dir>/SKILL.md
+    ├── FrontmatterParser.parse() → (name, description, controls...)
+    └── 构造 SkillMetadata，加入索引
+    │
+    ▼
+SkillIndex（list[SkillMetadata]）
+    │
+    ├── [AgentCore] 调用 .to_model_view() 注入给模型（Level 1）
+    └── [AgentCore] 调用 .find(name) 定位技能目录（执行前）
+```
 
-skill roots 是一组目录（含优先级/来源标签），默认顺序（高→低）：
+---
 
-1. 项目级：`<repo>/.agent/skills/`
-2. 用户级：`~/.agent/skills/`
-3. 内置级：安装包自带目录（只读）
+## 3. SkillRegistry 接口
 
-每个 root 需要携带：
+```python
+# src/skills/registry.py
+from pathlib import Path
+from typing import Optional
+from .metadata import SkillMetadata
+from .frontmatter import FrontmatterParser
 
-- `source`: `project | user | builtin`
-- `path`: 绝对路径
-- `priority`: 数值或按顺序隐含
+class SkillRegistry:
+    """
+    技能注册表。
+    扫描多个 skill root，构建 SkillMetadata 列表。
+    在 Agent 启动时调用 scan()，运行期间使用缓存结果。
+    """
 
-### 2.2 输出：Skill Index（仅元数据）
+    def __init__(self, skill_roots: list[dict]):
+        """
+        skill_roots: 配置列表，每项包含 source、path、priority。
+        示例：[
+            {"source": "project", "path": ".agent/skills", "priority": 0},
+            {"source": "user",    "path": "~/.agent/skills", "priority": 1},
+        ]
+        """
+        self._roots = [
+            {
+                "source": r["source"],
+                "path": Path(r["path"]).expanduser().resolve(),
+                "priority": r.get("priority", 99),
+            }
+            for r in skill_roots
+        ]
+        self._index: list[SkillMetadata] = []
+        self._scanned = False
 
-Skill Index 是一个技能条目数组，供 Agent Core 注入给模型。条目建议字段：
+    def scan(self) -> list[SkillMetadata]:
+        """
+        扫描所有 skill root，返回 SkillMetadata 列表。
+        同名技能按 priority 取优先级更高的（数值越小优先级越高）。
+        结果缓存在内存中，多次调用 scan() 重新扫描（刷新缓存）。
+        """
+        candidates: dict[str, tuple[SkillMetadata, int]] = {}  # name → (meta, priority)
+
+        for root in sorted(self._roots, key=lambda r: r["priority"]):
+            root_path: Path = root["path"]
+            if not root_path.is_dir():
+                continue
+
+            for skill_dir in root_path.iterdir():
+                if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+                    continue
+
+                skill_md = skill_dir / "SKILL.md"
+                if not skill_md.exists():
+                    continue
+
+                try:
+                    meta = FrontmatterParser.parse_skill(skill_md, root["source"])
+                except Exception:
+                    continue  # 解析失败：忽略该技能，记录日志
+
+                # 冲突解决：优先级更高（priority 数值更小）的 source 胜出
+                if meta.name not in candidates or root["priority"] < candidates[meta.name][1]:
+                    candidates[meta.name] = (meta, root["priority"])
+
+        self._index = [m for m, _ in candidates.values()]
+        self._scanned = True
+        return self._index
+
+    def all(self) -> list[SkillMetadata]:
+        """返回缓存的技能列表（未扫描时先触发 scan）。"""
+        if not self._scanned:
+            self.scan()
+        return self._index
+
+    def find(self, name: str, source: Optional[str] = None) -> Optional[SkillMetadata]:
+        """
+        按名称（可选 source）查找技能。
+        Agent Core 在执行 LOAD_SKILL 时使用此接口定位技能目录。
+        """
+        for meta in self.all():
+            if meta.name == name:
+                if source is None or meta.source == source:
+                    return meta
+        return None
+
+    def to_index_text(self) -> str:
+        """
+        生成注入给模型的技能索引文本（仅模型可见层）。
+        示例：
+          - name=pdf-form-filler | source=project | description=...
+        """
+        lines = []
+        for meta in self.all():
+            view = meta.to_model_view()
+            lines.append(
+                f"- name={view['name']} | source={view['source']} | description={view['description']}"
+            )
+        return "\n".join(lines) if lines else "(no skills available)"
+```
+
+---
+
+## 4. FrontmatterParser
+
+```python
+# src/skills/frontmatter.py
+import yaml
+from pathlib import Path
+from .metadata import SkillMetadata, ResourceLimits
+
+# YAML 前言字段白名单（只解析这些字段，忽略其他）
+_ALLOWED_FIELDS = {
+    "name", "description", "version", "allowed-tools", "resource-limits",
+}
+
+class FrontmatterParser:
+    """
+    SKILL.md YAML 前言解析器。
+    安全约束：使用 yaml.safe_load，拒绝注入字符，限制大小。
+    """
+
+    MAX_FRONTMATTER_LINES = 50
+    MAX_FIELD_LENGTH = 500
+
+    @classmethod
+    def parse_skill(cls, skill_md: Path, source: str) -> SkillMetadata:
+        """
+        解析 SKILL.md 文件，提取 YAML 前言并构造 SkillMetadata。
+        抛出 ValueError / yaml.YAMLError 表示解析失败。
+        """
+        raw = skill_md.read_text(encoding="utf-8")
+        frontmatter, _ = cls._split(raw)
+        data = cls._parse_yaml(frontmatter)
+
+        name = cls._require_str(data, "name")
+        description = cls._require_str(data, "description")
+
+        # 安全检查：禁止含 < 或 > 的值（防止 HTML/提示注入）
+        for field in (name, description):
+            if "<" in field or ">" in field:
+                raise ValueError(f"Frontmatter field contains forbidden characters: {field!r}")
+
+        # 解析 allowed-tools
+        allowed_tools = data.get("allowed-tools", [])
+        if isinstance(allowed_tools, str):
+            allowed_tools = [t.strip() for t in allowed_tools.split(",")]
+
+        # 解析 resource-limits
+        limits_raw = data.get("resource-limits", {}) or {}
+        resource_limits = ResourceLimits(
+            max_script_time_sec=limits_raw.get("max-script-time-sec", 30),
+            max_concurrent_scripts=limits_raw.get("max-concurrent-scripts", 2),
+            max_memory_mb=limits_raw.get("max-memory-mb"),
+            allow_network=limits_raw.get("allow-network", False),
+        )
+
+        return SkillMetadata(
+            name=name,
+            description=description,
+            source=source,
+            skill_path=str(skill_md),
+            version=str(data.get("version", "1.0")),
+            allowed_tools=allowed_tools,
+            resource_limits=resource_limits,
+        )
+
+    @classmethod
+    def _split(cls, content: str) -> tuple[str, str]:
+        """
+        分离 YAML 前言（--- ... ---）与 Markdown 正文。
+        返回 (frontmatter_text, body_text)。
+        若无前言则 frontmatter_text 为空串。
+        """
+        lines = content.split("\n")
+        if not lines or lines[0].strip() != "---":
+            return "", content
+
+        end = None
+        for i, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                end = i
+                break
+
+        if end is None:
+            return "", content
+
+        if end > cls.MAX_FRONTMATTER_LINES:
+            raise ValueError(f"Frontmatter exceeds {cls.MAX_FRONTMATTER_LINES} lines")
+
+        frontmatter = "\n".join(lines[1:end])
+        body = "\n".join(lines[end + 1:])
+        return frontmatter, body
+
+    @classmethod
+    def _parse_yaml(cls, text: str) -> dict:
+        """使用 yaml.safe_load 解析，不允许任意 Python 对象。"""
+        result = yaml.safe_load(text) or {}
+        if not isinstance(result, dict):
+            raise ValueError("Frontmatter must be a YAML mapping")
+        # 只保留白名单字段
+        return {k: v for k, v in result.items() if k in _ALLOWED_FIELDS}
+
+    @classmethod
+    def _require_str(cls, data: dict, key: str) -> str:
+        val = data.get(key)
+        if not val or not isinstance(val, str):
+            raise ValueError(f"Missing or invalid required field: '{key}'")
+        if len(val) > cls.MAX_FIELD_LENGTH:
+            raise ValueError(f"Field '{key}' exceeds max length {cls.MAX_FIELD_LENGTH}")
+        return val.strip()
+```
+
+---
+
+## 5. 目录识别规则
+
+| 规则 | 说明 |
+|------|------|
+| 有效技能目录 | `<root>/<dir>/SKILL.md` 存在 |
+| 忽略隐藏目录 | 目录名以 `.` 开头则跳过 |
+| 忽略非目录项 | 文件直接跳过 |
+| 缺少 SKILL.md | 目录跳过，不报错 |
+| 前言解析失败 | 记录 WARNING 日志，跳过该技能 |
+| 缺少 name/description | 解析失败，跳过 |
+
+---
+
+## 6. 冲突解决规则
+
+同一 `name` 在多个 root 中存在时：
+
+```
+优先级数值越小 → 优先级越高 → 胜出
+
+project (priority=0) > user (priority=1) > builtin (priority=2)
+```
+
+同一 root 内重复 name（理论上不应发生）：取最后扫描到的一个，并写入 WARNING 日志。
+
+冲突决议记录在 `scan()` 的返回日志（可选）中，格式示例：
 
 ```json
 {
-  "name": "pdf-form-filler",
-  "description": "Extract and fill PDF form fields using Python",
-  "source": "project",
-  "path": "/abs/repo/.agent/skills/pdf-form-filler",
-  "controls": {
-    "disable_model_invocation": false,
-    "user_invocable": true,
-    "allowed_tools": ["read_file", "run_script"]
-  },
-  "meta": {
-    "version": "1.0.0",
-    "author": "team"
-  }
+  "conflicts": [
+    {
+      "name": "code-review",
+      "winner": {"source": "project", "path": "..."},
+      "overridden": {"source": "user", "path": "..."}
+    }
+  ]
 }
 ```
 
-约束：
+---
 
-- `name` 与 `description` 必须存在且为短文本
-- `controls` 中的字段是“执行约束提示”，最终强制执行由 Agent Core/Tools Runtime 完成
+## 7. 缓存策略
 
-### 2.3 核心接口（建议）
+- **一次 run 内固定索引**：Agent Core 在 run 开始时调用 `scan()`，之后使用缓存，run 期间不再重新扫描。这保证同一次任务中技能集不会变化，事件流可回放。
+- **chat 模式**：每轮用户请求调用 `all()`，无需重新扫描（技能目录预期不在对话中途变化）。
+- **显式刷新**：`skills-agent skills refresh` 命令或安装/卸载技能后触发重新 `scan()`。
 
-- `build_index(roots, options) -> {skills, report}`
-- `refresh_index(changes?) -> {skills, report}`
+---
 
-其中 `report` 用于审计与调试（扫描耗时、发现数量、忽略原因、冲突决议等）。
+## 8. 验收标准
 
-## 3. 目录约定与发现规则
+- [ ] `scan()` 在测试 fixtures 目录（含 2 个技能）返回 2 个 SkillMetadata
+- [ ] `find("example-skill")` 返回正确的 SkillMetadata，`skill_path` 正确指向 SKILL.md
+- [ ] 同名技能：project 来源优先于 user 来源
+- [ ] 前言缺少 `name` 时该技能被忽略（不影响其他技能的扫描）
+- [ ] 前言含 `<` 字符时抛出 ValueError（而不是将注入内容送入模型）
+- [ ] `to_index_text()` 输出不含 `allowed_tools`、`skill_path` 等控制字段
 
-### 3.1 技能目录结构识别
+---
 
-Skill Registry 仅通过文件系统结构识别技能：
+## 9. 设计权衡说明
 
-- 技能目录：`<root>/<skill_dir>/`
-- 必须存在：`<root>/<skill_dir>/SKILL.md`
-
-技能名来源建议优先级：
-
-1. `SKILL.md` YAML 前言 `name`
-2. 若前言缺失或解析失败：拒绝该技能目录（默认严格模式）
-
-### 3.2 忽略规则
-
-建议忽略：
-
-- 隐藏目录（以 `.` 开头）
-- 非目录项
-- 缺少 `SKILL.md` 的目录
-
-## 4. 元数据解析（YAML 前言子集）
-
-### 4.1 解析范围（子集字段）
-
-必需字段：
-
-- `name: <string>`
-- `description: <string>`
-
-建议支持字段：
-
-- `version: <string>`
-- `author: <string>`
-- `disable-model-invocation: <bool>`
-- `user-invocable: <bool>`
-- `allowed-tools: <list|string>`
-
-### 4.2 安全约束
-
-前言内容将被用于“模型可见的技能索引”，因此必须防注入：
-
-- 禁止前言出现 `<` 与 `>` 字符（默认强约束）
-- 限制长度：例如前言最大 200 行、每行最大 500 字符
-- 仅解析简单标量与简单列表；遇到复杂嵌套结构直接拒绝或忽略非白名单字段
-
-### 4.3 容错策略（严格 vs 宽松）
-
-默认建议严格模式：
-
-- 前言解析失败或缺少必需字段：该技能目录不进入索引，并记录忽略原因
-
-可选宽松模式（用于迁移/兼容）：
-
-- 若缺少 `description`：用空串或默认描述并标记 `diagnostics`
-- 若 `allowed-tools` 为字符串：按逗号拆分为列表
-
-## 5. 冲突解决与优先级规则
-
-冲突定义：同一 `name` 在多个 root 中存在。
-
-默认规则：
-
-- 选择优先级更高的 root（project > user > builtin）
-- 若同一 root 内出现重复 name：选择最近修改时间更晚的一个，并记录冲突报告
-
-显式覆盖：
-
-- 结构化动作中可以指定 `source`
-- Agent Core 可将 `source` 作为过滤条件请求 Skill Registry 只返回某来源条目
-
-可审计输出：
-
-- 对每个被覆盖的条目记录：被覆盖版本、来源、路径、决议原因
-
-## 6. 缓存与刷新策略
-
-### 6.1 缓存目标
-
-- 避免每轮 Decide 都扫描全盘
-- 保证技能索引稳定，支持在 run 生命周期内一致
-
-### 6.2 刷新触发
-
-建议刷新触发点：
-
-- Agent 启动：必刷新
-- `skills install/uninstall` 完成后：刷新
-- 用户显式请求：`skills refresh`
-
-可选增强：
-
-- 基于目录 mtime 的轻量检测
-- 基于文件哈希的增量刷新（更重）
-
-### 6.3 缓存一致性
-
-建议在一次 run 中固定使用同一个 Skill Index 版本（snapshot），避免执行过程中技能集变化导致不可回放。
-
-- run 启动时：记录 index hash
-- audit 落盘：保存 skills index 快照（或保存 hash + 可重建信息）
-
-## 7. 暴露给模型的索引格式（Level 1 注入）
-
-Agent Core 将 Skill Index 注入模型上下文时，建议只暴露必要字段：
-
-- `name`
-- `description`
-- `source`
-
-其余字段（path、controls、meta）属于执行层信息，可由 Agent Core 保留在运行态，不直接给模型或只以最小必要形式提示。
-
-示例（面向模型的列表）：
-
-```text
-Available Skills:
-- name=pdf-form-filler | source=project | description=Extract and fill PDF form fields using Python
-- name=code-review | source=user | description=Review a Python codebase with our standards
-```
-
-## 8. 报告与可观测性（与事件流/落盘协作）
-
-Skill Registry 需要产出结构化 report，供 Agent Core 输出事件并落盘，例如：
-
-- 扫描 roots 列表与耗时
-- 总发现数量、有效数量、忽略数量与原因
-- 冲突数量与决议明细
-- 最终 skills index hash（用于回放一致性）
+| 决策点 | 选择 | 替代方案 | 选择理由 |
+|--------|------|----------|----------|
+| 前言解析库 | PyYAML safe_load | yaml.load / 手写解析 | safe_load 禁止任意对象，安全有保证 |
+| 前言字段白名单 | 只解析已知字段 | 允许任意字段 | 防止技能作者注入未知字段影响系统行为 |
+| 冲突解决策略 | 按 priority 数值取优先 | 用户显式指定 | 规则简单、可预测、无需用户干预 |
+| 正文读取位置 | 不在 Registry 读 | Registry 读全部 | 将"发现"与"按需加载"职责严格分离 |
+| 扫描时机 | 启动时一次性扫描 | 按需懒加载 | 保证 run 期间技能集一致，便于审计回放 |

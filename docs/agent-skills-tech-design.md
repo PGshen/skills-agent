@@ -1,6 +1,9 @@
-# Agent Skills 技能模式：Python 原生实现技术方案（草案）
+# Agent Skills 技能模式：技术方案（草案）
 
-本方案用于在本项目实现一个 Agent，使其支持 Agent Skills 技能模式的“标准完整能力”：技能目录结构、技能发现与索引、渐进式披露、技能组合、权限控制、技能分发与安装、评估与回归。
+本方案用于实现一个支持 Agent Skills 技能模式的 Python Agent，核心定位为：
+
+1. **学习与深入理解 Agent 系统设计**：覆盖技能发现、渐进式披露、ReAct 主循环、权限模型、上下文管理等核心机制。
+2. **为特定应用场景提供轻量 Skill 运行时**：无 LangChain 等重量级框架依赖，可嵌入具体产品。
 
 说明：本文仅为技术方案，不包含实现代码。
 
@@ -12,24 +15,29 @@
 - 支持渐进式披露三层加载：
   - 启动仅加载 `name/description` 形成技能索引
   - 触发时加载 `SKILL.md` 正文
-  - 需要时再读取 resource 或执行 scripts，并将"结果"注入上下文
+  - 需要时再读取 resource 或执行 scripts，并将”结果”注入上下文
 - 支持多技能根目录与优先级：项目级、用户级、内置级。
-- 支持技能分发：技能包（zip）安装/卸载/列出/校验。
 - 支持权限模型（最小权限）：
   - 技能声明可用工具白名单（例如 `allowed-tools`）
   - Agent 运行时强制执行白名单与高风险动作审批
 - 支持技能可组合：一次任务可触发多个技能，并有冲突与优先级规则。
-- 提供可评估能力（Evals）：基于用例集对触发、步骤、输出进行回归。
-- 支持容错与恢复：错误处理、重试策略、Plan持久化与崩溃恢复。
-- 支持上下文管理：token限制下的智能裁剪与技能内容优先级管理。
-- 支持资源配额：CPU、内存、磁盘、网络、并发数等资源限制。
-- 支持可观测性：结构化审计、分级日志、性能指标、调试模式。
+- 支持容错与恢复：错误处理、重试策略、Plan 持久化与崩溃恢复。
+- 支持上下文管理：token 限制下的智能裁剪与技能内容优先级管理。
+- 支持资源配额：并发数、执行超时等可强制执行的约束。
+- 支持可观测性：结构化事件流审计、分级日志、调试模式。
 
 ### 1.2 非目标（Not now）
 
-- 不做强沙箱隔离（Python 标准库无法可靠实现 OS 级隔离）；只做“受控执行”（超时、目录隔离、命令白名单、环境清理）。
-- 不绑定某一家 LLM 供应商；提供可插拔的模型适配层（后续接入 OpenAI/Anthropic/本地模型）。
-- 不实现复杂 YAML 全量解析；实现与技能标准匹配的“YAML 前言子集解析”（满足 name/description 与常用字段）。
+- **不做技能包分发系统**（zip 安装/卸载/校验/签名）：当前阶段直接使用文件系统管理技能目录，分发能力列为后续增强。
+- **不做 Evals 评估框架**：结构化回归评估（用例集/指标输出/MockModel 批跑）列为后续增强；当前阶段通过手动测试与日志审计验证正确性。
+- **不做强沙箱隔离**（Python 标准库无法可靠实现 OS 级隔离）；只做”受控执行”（超时、目录隔离、命令白名单、环境清理）。
+- **不绑定某一家 LLM 供应商**；提供可插拔的模型适配层（Anthropic / OpenAI-compatible / 本地模型）。
+
+### 1.3 第三方库策略
+
+- **允许使用**：`requests`（HTTP）、`PyYAML`（YAML 解析）、`pydantic`（结构验证）等常用轻量库。
+- **禁止引入**：LangChain、LlamaIndex、AutoGPT 等重量级 Agent 框架（避免框架绑定与黑盒依赖）。
+- **自行实现**：流式 JSON 解析器（调研后无合适三方库满足路径匹配 + 增量回调需求）。
 
 ## 2. 文档组织（总览 vs 子系统）
 
@@ -37,21 +45,26 @@
 
 - 关键设计选择（特别是 Agent Core 的规划与执行机制）
 - 子系统边界、接口与关键约束
-- 渐进式披露、权限、分发的“标准要求”
+- 渐进式披露、权限的”标准要求”
 
-各子系统的细化设计后续在以下子文档展开（先占位，后续逐步补充）：
+各子系统的细化设计在以下子文档展开：
 
+**当前阶段实现（核心链路）**：
 - [Agent Core 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md)
 - [Skill Registry 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-registry.md)
 - [Skill Loader 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-loader.md)
 - [Model Adapter 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/model-adapter.md)
 - [Tools Runtime 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/tools-runtime.md)
-- [Distribution & CLI 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/distribution-cli.md)
-- [Evals 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/evals.md)
+- [Chat 会话管理与上下文工程设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/chat-session.md)
+- [流式输出架构设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/streaming-output.md)
+
+**后续阶段（暂不实现）**：
+- [Distribution & CLI 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/distribution-cli.md) — 技能包分发与安装
+- [Evals 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/evals.md) — 结构化评估与回归
 
 ## 3. 总体架构（系统视图）
 
-系统分为 6 个核心子系统，Agent Core 负责“规划+执行”的主循环，其余子系统提供技能发现/加载、工具执行、模型对接、分发与评估能力。
+系统分为 5 个核心子系统，Agent Core 负责”规划+执行”的主循环，其余子系统提供技能发现/加载、工具执行与模型对接能力。Distribution & CLI 和 Evals 为后续阶段，暂不在核心架构中体现。
 
 ```mermaid
 flowchart TB
@@ -60,12 +73,9 @@ flowchart TB
   core <--> registry[Skill Registry]
   core <--> loader[Skill Loader]
   core <--> tools[Tools Runtime]
-  core <--> dist[Distribution & CLI]
-  dist --> evals[Evals Runner]
 
   registry --> roots[(Skill Roots)]
   loader --> roots
-  dist --> roots
 
   roots --- project[Project skills]
   roots --- userroot[User skills]
@@ -145,11 +155,12 @@ Plan 的创建与更新依赖"提示词 + 结构化输出约束"来引导模型�
 
 - Plan 如何更新
   - 提示词要求模型基于：当前 Plan + 最新 observation + 预算约束，输出下一步结构化动作。
-  - 同时允许模型在同一响应中返回 `plan_update`（全量替换或 patch 形式），用于：
+  - 同时允许模型在同一响应中返回 `plan_update`（**全量替换**），用于：
     - 添加/删除/重排 steps
     - 更新 step 状态（pending/in_progress/completed）
     - 补充或修正 assumptions
     - 调整 constraints（例如预算压力下的降级策略）
+  - **MVP 阶段只支持全量替换**：模型返回完整的新 Plan 对象，Agent Core 用其覆盖当前 Plan 并落盘。patch 模式（增量更新）作为后续增强项，原因：patch 格式依赖模型稳定产出语义正确的变更描述，且 Agent Core 需实现合并逻辑与冲突处理，MVP 阶段不引入此复杂度。
 
 ### 4.3.2 Plan 持久化与恢复
 
@@ -162,7 +173,12 @@ Plan 的创建与更新依赖"提示词 + 结构化输出约束"来引导模型�
 - 恢复机制
   - Agent 启动时检查是否存在未完成的 run（状态非 `completed`/`failed`）
   - 提供 `--resume <run-id>` 选项从上次断点恢复
-  - 恢复时重新加载：Plan、已加载技能、审计记录、上下文摘要
+  - 恢复时重新加载：Plan、已加载技能列表、审计记录
+  - **上下文重建策略（关键）**：模型的多轮对话语义依赖完整的 message 历史，仅恢复 Plan 不足以让模型正确推进。MVP 阶段采用"压缩重建"方式：
+    - 从 `events.jsonl` 读取已执行的动作序列与 observation 摘要
+    - 构造一条"恢复摘要消息"注入上下文（格式：`已完成步骤 + 关键 observation + 当前 Plan`）
+    - 明确标注本次为恢复执行，让模型基于摘要而非完整历史继续
+  - 后续增强（非 MVP）：完整落盘每轮的 messages 原文（含 role/content），恢复时精确重建 message 列表，代价是存储翻倍但恢复语义更准确
 
 - 清理策略
   - 默认保留最近 N 次 run（例如 10 次）
@@ -213,7 +229,9 @@ Agent Core 需要稳健的错误处理策略，避免单点失败导致整体崩
   - 网络超时：可重试动作（如 `load_resource` from URL）
 
 - Plan 异常检测
-  - 死循环检测：连续N轮无进展（step状态不变）触发告警
+  - **死循环检测（双重机制）**：
+    1. **动作哈希检测**（主要机制，不依赖模型诚实性）：对最近 K 轮动作的（类型 + 关键参数）计算哈希，若出现重复模式则直接触发停止。此机制不依赖 Plan 中的 step 状态是否被模型正确更新。
+    2. **Plan 进展检测**（辅助机制）：连续 N 轮 step 状态均无变化时触发告警，用于在哈希检测之前给出早期预警。
   - 预算耗尽：达到最大轮次/token时，强制要求模型输出 `final_answer`（附带未完成标记）
   - 冲突检测：模型请求禁止工具时，记录违规并拒绝执行
 
@@ -233,8 +251,8 @@ sequenceDiagram
 
   U->>A: request
   A->>R: scan skill roots (metadata only)
-  R-->>A: skill index (name/description/source/controls)
-  A->>M: prompt + skill index
+  R-->>A: skill index (name/description/source/controls内部持有)
+  A->>M: prompt + skill index (仅name/description/source)
   M-->>A: select_skills / tool action
   alt select_skills
     A->>L: load SKILL.md body
@@ -340,19 +358,24 @@ sequenceDiagram
 - `disable-model-invocation: <bool>`：从技能索引中隐藏（不允许模型自动触发）
 - `user-invocable: <bool>`：是否在 UI/CLI 列表展示为可直接调用
 - `allowed-tools: <list|string>`：允许工具白名单（如 `["read_file","grep","run_script"]`）
-- `run-mode: inline|subagent`：是否在子代理执行（可选增强）
+- `run-mode: inline|subagent`：**MVP 阶段预留字段，当前版本行为等同 inline，subagent 模式（独立 Agent 实例执行）为后续阶段设计，实现前请忽略此字段。**
 - `requires: <list>`：依赖的其他技能（例如 `["base-utils", "json-parser"]`）
 - `load-priority: high|normal|low`：加载优先级（默认 normal）
 - `resource-limits`：资源配额约束
-  - `max-script-time-sec: <int>`：单脚本最大执行时间（秒）
-  - `max-memory-mb: <int>`：最大内存使用（MB）
-  - `max-concurrent-scripts: <int>`：最大并发脚本数
-  - `allow-network: <bool>`：是否允许网络访问
+  - `max-script-time-sec: <int>`：单脚本最大执行时间（秒）— **强制执行**：通过 subprocess 超时机制可靠终止
+  - `max-concurrent-scripts: <int>`：最大并发脚本数 — **强制执行**：通过信号量（semaphore）控制
+  - `max-memory-mb: <int>`：最大内存使用（MB）— **尽力约束**：Python 在 macOS 上无法可靠限制子进程内存（`resource.setrlimit` 对内存在 macOS 无效），仅作审计参考，**不应作为安全边界依赖**
+  - `allow-network: <bool>`：是否允许网络访问 — **尽力约束**：可通过环境变量或 proxy 设置施加软限制，但无 OS 级隔离保障
+
+解析实现：
+
+- 使用 **`PyYAML`**（`yaml.safe_load`）解析前言区，`safe_load` 禁止 Python 对象反序列化，安全性有保证。
+- 解析后对字段做白名单校验：只提取已知字段，未知字段忽略；类型不符直接拒绝加载该技能并记录错误。
 
 解析约束（安全）：
 
-- 前言区禁止 `<` `>`（降低高优先级注入风险）。
-- 仅支持标量与简单列表；复杂嵌套不解析或直接拒绝。
+- 前言区禁止 `<` `>`（降低提示词注入风险），在 `safe_load` 之前做字符串预检。
+- 仅信任标量与简单列表值；若已知字段的值为复杂嵌套结构，拒绝加载。
 
 ### 6.2 正文结构建议（供技能作者）
 
@@ -373,15 +396,15 @@ sequenceDiagram
 
 - 扫描 skill roots，找到所有 `<skill-name>/SKILL.md`。
 - 仅解析 YAML 前言，提取 `name/description`（以及必要控制字段）。
-- 构建 Skill Index：
+- 构建 Skill Index（Agent Core 内部完整版）：
   - `skill_id`（来源+名称+版本）
   - `name`
   - `description`
   - `source`（project/user/builtin）
   - `path`
-  - `controls`（disable-model-invocation、allowed-tools 等）
+  - `controls`（disable-model-invocation、allowed-tools 等）— **仅 Agent Core 内部使用**
 
-向模型暴露的内容只包含“可用技能列表（name + description + source）”，不包含正文与资源。
+向模型暴露的内容只包含”可用技能列表（name + description + source）”，**不包含 controls 字段**（`allowed-tools` 等权限信息由 Agent Core 在执行侧校验，不进入模型输入上下文，以防模型受提示词注入诱导优先选择高权限技能）。
 
 ### 7.2 触发阶段（Level 2：加载正文）
 
@@ -435,17 +458,37 @@ sequenceDiagram
 
 Agent Core 负责校验动作合法性（路径是否在技能目录内、工具是否允许、是否需要审批等）。
 
+### 8.3 结构化输出实现机制
+
+模型必须输出结构化动作，需要明确采用的约束机制：
+
+- **首选：模型原生 tool use / function calling**
+  - 将动作类型定义为"工具声明"（tool schema），由模型选择调用哪个工具并填充参数
+  - 优势：模型原生支持，输出格式有 provider 保障，重试更稳定
+  - 适用：Anthropic（tool_use）、OpenAI（function calling）等支持 tool use 的模型
+
+- **次选：JSON mode（response_format: json_object）**
+  - 系统提示中附加 JSON schema 约束，要求模型严格输出合法 JSON
+  - 适用：支持 JSON mode 但不支持 tool use 的模型（或本地模型）
+  - 注意：需在 Model Adapter 层做 JSON schema 校验与解析失败重试
+
+- **不推荐：纯 prompt 约束**
+  - 仅靠提示词要求模型输出 JSON，无 provider 级格式保障
+  - 适用：MockModel 内部测试，或作为降级兜底（可靠性最低，需增加重试次数）
+
+**MockModel**（用于离线测试）固定按用例文件中的动作序列返回，与上述机制解耦，不受限于 provider 能力。
+
 ## 9. 工具与权限模型（概要）
 
 详见：[Tools Runtime 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/tools-runtime.md)。
 
-### 7.1 工具分类
+### 9.1 工具分类
 
 - 低风险：`read_file`, `list_dir`, `grep`（只读）
 - 中风险：`run_script`（本地执行）
 - 高风险：`write_file`, `network_request`, `delete_file`（破坏性/外联）
 
-### 7.2 权限来源（合并规则）
+### 9.2 权限来源（合并规则）
 
 最终允许工具集合 = 全局配置允许 ∩ 技能 allowed-tools（如存在） ∩ 运行时策略
 
@@ -454,108 +497,192 @@ Agent Core 负责校验动作合法性（路径是否在技能目录内、工具
 - 全局默认仅允许只读工具，执行脚本/写文件必须显式开启。
 - 技能声明 allowed-tools 进一步收紧权限。
 
-### 7.3 审批机制（交互式/非交互式）
+### 9.3 审批机制（交互式/非交互式）
 
 - 交互式：命令行提示用户批准（支持 `--yes` 禁止默认通过）。
 - 非交互式：CI/批处理模式下，遇到需审批工具直接失败并给出可重放命令。
 
-### 7.4 审计与可追溯
+### 9.4 审计与可追溯
 
 每次执行记录：
 
 - 请求摘要、选择的技能、加载的资源、调用的工具、脚本退出码、关键输出摘要。
 - 记录位置：`.agent/runs/<timestamp>/run.json`（建议）。
 
-## 10. 分发与安装方案（概要）
+## 10. 分发与安装方案（后续阶段，暂不实现）
 
-详见：[Distribution & CLI 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/distribution-cli.md)。
+> 当前阶段技能目录直接通过文件系统管理（手动复制 / git clone）。zip 包安装/卸载/签名校验等功能列为后续增强。详细设计保留于：[Distribution & CLI 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/distribution-cli.md)。
 
-### 8.1 技能包格式（zip）
+## 11. 评估与回归 Evals（后续阶段，暂不实现）
 
-zip 内部结构要求：
+> 当前阶段通过手动测试与事件流日志（`events.jsonl`）审计正确性。结构化用例集、精确指标输出与 MockModel 批量回归列为后续增强。详细设计保留于：[Evals 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/evals.md)。
+>
+> **MockModel**（用于阶段 A 骨架验证）仍在当前阶段实现，但其唯一目标是按配置序列驱动 Agent 主循环，不涉及评分与回归报告。
+
+## 12. 会话管理与多轮对话上下文工程
+
+多轮对话涉及两个层面：
+
+- **Agent 内部多轮**（已设计于 Section 4）：单次任务内的 ReAct 循环，由 Agent Core 管理。
+- **用户侧多轮**（本节）：用户在收到 `final_answer` 后继续提问，需要跨任务的会话记忆与上下文管理。
+
+详细设计见：[Chat 会话管理与上下文工程设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/chat-session.md)
+
+### 12.1 运行模式
+
+CLI 支持两种模式：
+
+```bash
+skills-agent run "query"   # 单次模式：无会话记忆，每次独立执行
+skills-agent chat          # 会话模式：维护多轮对话，直到用户主动退出
+```
+
+两种模式共用同一个 `AgentCore`，区别仅在外层循环是否持续读取用户输入。
+
+### 12.2 上下文组装策略（三层结构）
+
+每次新用户请求到来时，按以下层次构建 messages 发给模型：
 
 ```
-skills-pack.zip
-  <skill-name-1>/SKILL.md
-  <skill-name-1>/...
-  <skill-name-2>/SKILL.md
-  <skill-name-2>/...
+┌──────────────────────────────────────────────────┐
+│ 系统层（永不压缩，每次重建）                          │
+│   • 系统 prompt（Agent 角色说明）                   │
+│   • 当前技能索引（list_model_views() 实时生成）       │
+├──────────────────────────────────────────────────┤
+│ 历史摘要层（有压缩历史时存在）                         │
+│   • 一条 user-role 消息，格式：                      │
+│     <summary>历史：用户曾问了...，Agent 做了...，      │
+│     结论是...</summary>                             │
+├──────────────────────────────────────────────────┤
+│ 近期原文层（最近 K 轮完整对话，默认 K=3）              │
+│   • Turn N-2: user / assistant                   │
+│   • Turn N-1: user / assistant                   │
+├──────────────────────────────────────────────────┤
+│ 当前层                                             │
+│   • 本轮用户输入                                    │
+└──────────────────────────────────────────────────┘
 ```
 
-安装行为：
+关键约束：
+- 技能索引**每轮重建**（不缓存，技能目录可能在会话期间变化）
+- 历史摘要只保存"结果性事实"，不保存 ReAct 内部细节
+- 近期原文窗口 K 默认 3，可通过 `config.json` 调整
 
-- 解压到目标 skill root 下的临时目录
-- 校验每个技能：
-  - 存在 SKILL.md
-  - 前言可解析且包含 name/description
-  - 文件路径无越界（禁止 `../`）
-- 通过后原子移动到 `<skill-root>/<skill-name>/`
+### 12.3 压缩策略
 
-卸载行为：
+**触发条件**：`estimated_tokens(recent_turns) > context_limit × 25%`
 
-- 按 name 与 source 删除对应目录（保留备份可选）。
+**执行**：取最旧 M 轮 → 独立调用模型生成 150 字摘要 → 追加到 `compressed_summary` → 从 `recent_turns` 移除。
 
-### 8.2 校验与信任
+会话状态持久化于 `.agent/sessions/<session-id>/`（session.json / context.json / conversation.jsonl）。
 
-可选增强（后续迭代）：
+---
 
-- `skills-pack.zip.sig` 签名校验
-- `manifest.json`（hash 列表）用于完整性校验
+## 13. 流式输出架构
 
-MVP：提供 `skills verify` 命令输出哈希，便于人工审计与对比。
+输出系统需同时满足 CLI 终端实时输出与未来 API 流式推送两个场景，且**不要求修改 Agent Core 代码**即可扩展。
 
-## 11. 评估与回归（Evals）（概要）
+详细设计见：[流式输出架构设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/streaming-output.md)
 
-详见：[Evals 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/evals.md)、[Model Adapter 设计](file:///Users/peng/Me/Ai/skills-agent/docs/design/model-adapter.md)。
+### 13.1 核心抽象：OutputSink
 
-### 9.1 用例格式（建议）
+```python
+class OutputSink:
+    """基类，所有方法空实现。子类只需覆盖关心的方法。"""
 
-每个用例包含：
+    def on_progress(self, action: str, detail: str = "") -> None: ...
+    def on_plan_updated(self, plan: Plan) -> None: ...
+    def on_text_chunk(self, chunk: str, done: bool) -> None: ...
+    def on_observation(self, source: str, content: str) -> None: ...
+    def on_error(self, message: str, recoverable: bool = True) -> None: ...
+    def on_session_end(self, turn_count: int, status: str) -> None: ...
 
-- `input`: 用户请求文本
-- `expected`: 期望技能选择（可为空）、期望关键步骤（动作序列约束）、期望输出模式（关键词/结构）
-- `constraints`: 最大工具调用次数、禁止工具等
+NullSink = OutputSink   # 空实现即为 NullSink（测试用）
+```
 
-### 9.2 指标输出
+### 13.2 实现层次
 
-- 触发：是否选择了正确技能（precision/recall）
-- 执行：动作序列是否满足约束（例如必须先 load_skill 再 run_script）
-- 输出：是否满足结构与关键要点
-- 成本：tokens/时延/工具调用次数（若模型适配层提供）
+| 实现 | 场景 | 阶段 |
+|------|------|------|
+| `NullSink` | 测试，零副作用 | Phase A |
+| `CLISink` | 终端实时输出（进度→stderr，答案→stdout） | Phase A |
+| `SSESink` | HTTP SSE 推送，未来 API 服务 | Phase C |
 
-### 9.3 Mock 模型的重要性
+### 13.3 Agent Core 集成
 
-为保证本项目在无外部依赖下可跑通评估，需要内置 MockModel：
+`AgentCore` 构造时接受 `sink: OutputSink = None`，默认 `NullSink()`。与输出方式完全解耦：
 
-- 固定输出动作序列（基于规则或用例文件指定）
-- 用于验证 Agent Core、权限、分发、加载器、审计与 CLI 的正确性
+```
+CLI:    AgentCore(sink=CLISink())
+API:    AgentCore(sink=SSESink(response_stream))
+Test:   AgentCore(sink=NullSink())  # 或 RecordSink()
+```
 
-## 12. MVP 分阶段交付（供你确认后实施）
+Phase C 起，`AnthropicAdapter` 通过 `StreamingJSONParser` 的 `$.final_answer.content` 回调将答案流式传给 `sink.on_text_chunk(chunk, done)`，实现逐字打印。
 
-阶段 A：技能系统骨架（无真实 LLM）
+---
 
-- 技能扫描与索引
-- SKILL.md 前言解析（子集）
-- 渐进式披露加载器（正文/资源）
-- CLI：list/inspect/verify/install/uninstall
-- MockModel + 动作协议 + 工具运行时（只读工具 + 审计）
+## 14. 分阶段交付
 
-阶段 B：执行能力与安全策略
+### 阶段 A：核心链路打通（技能发现 → 加载 → Agent 主循环 → 工具执行 → CLI 输出）
 
-- run_script 受控执行（超时、隔离目录、输出截断）
-- 审批机制（交互式）
-- allowed-tools 强制与冲突处理
+目标：无真实 LLM 依赖，跑通完整骨架，所有核心子系统可独立测试，执行过程有实时进度输出。
 
-阶段 C：真实模型适配（可选）
+- **Skill Registry**：扫描 skill roots，用 `PyYAML safe_load` 解析 SKILL.md 前言，构建 SkillIndex（内部层 + 模型可见层分离）
+- **Skill Loader**：渐进式披露三层加载（元数据 / 正文 / 资源片段），路径越界校验，正文行数截断
+- **Agent Core 主循环**：ReAct + 显式 Plan（全量替换），状态机（Init → IndexSkills → Decide → Observe → Final），事件流输出
+- **MockModel**：按配置文件固定输出动作序列，用于骨架验证（无需真实 API）
+- **Tools Runtime（只读）**：`read_file` / `list_dir` / `grep`，权限合并（全局 ∩ allowed-tools），审计落盘
+- **OutputSink + CLISink**：进度行实时打印到 stderr，最终答案到 stdout，支持 `--verbose`
+- **CLI**：`run`（单次执行）、`chat`（交互式多轮，会话存储到 `.agent/sessions/`）、`skills list`、`skills inspect`
 
-- 通过 HTTP 适配 OpenAI-compatible 或 Anthropic（不引入第三方库）
-- 结构化动作输出的稳健解析与重试策略
+### 阶段 B：执行能力、安全策略与会话管理
 
-## 13. 验收标准（Definition of Done）
+目标：接入真实工具执行，完善权限管控与稳健性，实现多轮对话上下文压缩。
 
-- 在空项目中放入若干技能目录后，Agent 启动仅读取元数据即可列出技能索引。
-- 指定一个用例时，Agent 仅在被触发的技能上加载正文；未触发技能正文不读入上下文。
-- 资源文件不会被默认加载；仅在 load_resource 动作发生时读取。
-- zip 安装技能可用，且校验可阻止路径穿越与无 SKILL.md 的技能。
-- 权限白名单生效：技能声明不允许的工具无法被调用；高风险工具必须审批。
-- Evals 可在 MockModel 下离线跑通并输出报告。
+- **run_script 受控执行**：subprocess 超时（`max-script-time-sec` 强制），工作目录隔离，stdout/stderr 截断，并发信号量（`max-concurrent-scripts`）
+- **审批机制（交互式）**：高风险动作 CLI 提示（`--yes` 自动通过，CI 模式下直接失败）
+- **allowed-tools 强制**：拒绝技能未声明的工具，记录违规事件
+- **上下文裁剪**：按 P0-P3 优先级在接近 `max_context_chars` 时触发压缩
+- **崩溃恢复**：Run State 每轮落盘，`--resume` 从 events.jsonl 重建上下文
+- **ConversationCompressor**：超阈值时压缩最旧 M 轮为摘要，防止 chat 模式 context 无限膨胀
+
+### 阶段 C：真实模型接入与流式输出
+
+目标：接入真实 LLM，实现流式文本输出，完成端到端验证。
+
+- **Model Adapter（Anthropic）**：用 `requests` 调用 Anthropic Messages API，tool use 实现结构化动作输出，指数退避重试
+- **流式 JSON 解析器**：手写 FSM，支持 `$.action.type` / `$.final_answer.content` 等路径的增量回调
+- **流式输出接入**：`StreamingJSONParser` 的 `$.final_answer.content` 回调驱动 `CLISink.on_text_chunk()`，实现逐字打印
+- **SSESink**：实现 HTTP SSE 格式输出接收器，供未来 API 服务无缝接入
+- **结构化输出降级**：tool use → JSON mode → prompt-only 的优先级选择逻辑
+
+---
+
+## 15. 验收标准（Definition of Done）
+
+### 阶段 A 验收
+
+- 在空项目中放入若干技能目录后，`skills list` 仅读取前言元数据即可列出技能索引，不读取正文。
+- MockModel 驱动 Agent 主循环时，Agent 仅在被 `select_skills` 选中的技能上加载正文；未触发技能正文不读入上下文。
+- 资源文件不会被默认加载；仅在 `load_resource` 动作发生时读取对应文件。
+- `skills inspect <name>` 正确展示技能元数据（前言字段），不展示正文。
+- 事件流可在 `events.jsonl` 中完整回放每轮动作与 observation。
+- `skills-agent run "test"` 执行时 stderr 可见进度行（`→ load_skill: xxx`），stdout 只有最终答案。
+- `skills-agent chat` 支持至少 3 轮连续追问，第 2 轮起历史消息正确传入 AgentCore。
+
+### 阶段 B 验收
+
+- `run_script` 执行超时后被强制终止，timeout observation 正确注入上下文。
+- 技能 `allowed-tools` 白名单生效：技能未声明的工具调用被拒绝并记录违规事件。
+- 高风险动作在交互式模式下提示审批；`--yes` 模式下自动通过；CI 模式下直接失败并输出可重放命令。
+- 上下文超过阈值时触发裁剪，裁剪后 Plan 与最近 observation 保持完整。
+- 10 轮对话后触发历史压缩，`compressed_summary` 非空，`recent_turns` 长度不超过 `K*2`。
+
+### 阶段 C 验收
+
+- 用真实 Anthropic API 运行包含 `select_skills` + `load_resource` + `final_answer` 的完整任务，进度实时显示在 stderr。
+- 流式 JSON 解析器在模型逐 token 返回时，正确提取 `action.type` 并尽早触发。
+- 最终答案**逐字打印**（非等待完整响应），`on_text_chunk` 在生成过程中多次触发。
+- `SSESink` 单元测试通过，每个 SSE 事件格式符合规范（`data: {...}\n\n`）。
+- 结构化输出解析失败时触发重试（最多 3 次），超限后降级为错误 observation。

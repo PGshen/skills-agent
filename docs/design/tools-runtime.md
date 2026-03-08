@@ -1,212 +1,394 @@
 # Tools Runtime 设计
 
-本文档细化 Tools Runtime（工具运行时）的设计：工具集合定义、权限合并规则、审批机制、审计格式、以及脚本执行的受控策略（超时/工作目录隔离/环境变量清理/输出截断）。整体协作参见：[agent-core.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md)、[model-adapter.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/model-adapter.md)、[skill-loader.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/skill-loader.md)。
+**状态**：Phase B 完整实现（Phase A 不执行真实脚本）
 
-## 1. 系统定位与职责边界
+---
 
-Tools Runtime 是“可控执行层”，负责把 Agent Core 的结构化动作转换为受控的本地操作，并在执行前后强制执行安全策略与审计落盘协作：
+## 1. 设计目标
 
-- 工具调用校验：权限合并、危险操作审批、参数约束与路径约束
-- 工具执行：读取文件、目录遍历、文本搜索、执行脚本等
-- 输出受控：输出截断、摘要、内容哈希与引用落盘
-- 统一审计：为 Agent Core 的事件流与 run 落盘提供结构化执行记录
+Tools Runtime 是"可控执行层"，把 Agent Core 的结构化动作（`run_script`）转换为受控的本地操作：
 
-不在 Tools Runtime 内处理：
+| 职责 | 说明 |
+|------|------|
+| 权限校验 | 三方合并（全局配置 ∩ 技能声明 ∩ 运行时策略） |
+| 路径安全 | 脚本必须在技能目录内（realpath 前缀校验） |
+| 受控执行 | 超时 / 工作目录隔离 / 环境变量清理 / 输出截断 |
+| 审批机制 | 交互式（CLI 用户确认）/ 非交互式（CI 自动拒绝）|
+| 审计落盘 | 执行结果写入 EventLogger |
 
-- 决策与规划（由 Agent Core）
-- 技能索引与正文/资源加载（正文/资源读取建议由 Skill Loader；只读工具也可复用其安全策略）
-- 结构化动作解析与流式 JSON 解析（由 Model Adapter）
+**不在此处理**：
+- 模型决策与 Plan 更新（Agent Core 负责）
+- 技能发现与正文加载（Skill Registry / Skill Loader 负责）
+- 结构化 Action 解析（Model Adapter 负责）
 
-## 2. 工具集合与能力分级
+---
 
-### 2.1 最小工具集（MVP）
+## 2. 工具集合与风险分级
 
-- 只读类：
-  - `read_file`
-  - `list_dir`
-  - `grep`（按文本模式搜索）
-- 执行类：
-  - `run_script`
+### 2.1 MVP 工具集
+
+| 工具 | 风险等级 | 是否需要审批 |
+|------|----------|-------------|
+| `read_file` | low（只读） | 否 |
+| `list_dir` | low（只读） | 否 |
+| `grep` | low（只读） | 否 |
+| `run_script` | medium（本地执行） | 默认需要 |
 
 ### 2.2 高风险工具（默认关闭）
 
-- `write_file`
-- `delete_file`
-- `network_request`
+| 工具 | 风险等级 | 说明 |
+|------|----------|------|
+| `write_file` | high | 可能覆盖重要文件 |
+| `delete_file` | high | 不可逆删除 |
+| `network_request` | high | 数据外泄风险 |
 
-这些工具即使启用也必须强制审批，并提供可重放请求（用于 CI/非交互场景）。
+高风险工具即使开启也必须强制审批，不允许在 run 级别自动授权。
 
-### 2.3 工具风险等级
+---
 
-- low：只读、无副作用
-- medium：本地执行（脚本/命令），可能有副作用
-- high：写入/删除/网络外联，破坏性或外泄风险
-
-风险等级用于默认策略与审计标记。
-
-## 3. 权限模型（最小权限 + 三方合并）
+## 3. 权限模型（三方合并）
 
 ### 3.1 合并规则
 
-最终允许工具集合：
-
-全局配置允许 ∩ 技能 `allowed-tools`（若存在） ∩ 运行时策略（风险/环境/模式）
-
-解释：
-
-- 全局配置：系统级开关（例如默认只允许只读）
-- 技能 allowed-tools：技能自身声明进一步收紧
-- 运行时策略：根据运行模式（交互/CI）、风险等级、白名单等再收紧
-
-### 3.2 典型默认策略
-
-- 默认仅允许只读类工具
-- `run_script` 需要显式开启，并且默认需要审批或至少需要 “本次 run 授权”
-- 高风险工具默认关闭，除非用户显式开启且通过审批
-
-### 3.3 授权的作用域
-
-Tools Runtime 的授权可以按三种粒度配置（建议从严到宽）：
-
-- 单次调用：每次调用都审批
-- 本次 run：同一种工具在同一 run 内复用授权
-- 会话/全局：不建议默认启用（风险高）
-
-授权状态必须落盘到 run 目录（可审计、可回放）。
-
-## 4. 审批机制（交互式与非交互式）
-
-### 4.1 交互式审批（CLI）
-
-当触发需要审批的工具时：
-
-- Tools Runtime 生成审批请求对象（包含工具名、参数、风险、影响范围、可重放命令）
-- Agent Core 通过事件流对外输出 `approval_required`
-- CLI 由用户确认后返回 `approval_granted/denied`
-
-### 4.2 非交互式（CI/服务端）
-
-非交互模式下：
-
-- 若工具需要审批：默认拒绝并返回结构化错误
-- 同时输出“可重放请求”（例如 CLI 命令或 JSON 请求体）供人工执行或配置白名单
-
-### 4.3 审批请求格式（示意）
-
-```json
-{
-  "tool": "run_script",
-  "risk": "medium",
-  "reason": "Skill pdf-form-filler requested script execution",
-  "params": {
-    "skill": {"name": "pdf-form-filler", "source": "project"},
-    "relative_path": "scripts/fill.py",
-    "args": ["--input", "data.json"]
-  },
-  "replay": "agent run --approve run_script --skill pdf-form-filler -- scripts/fill.py --input data.json"
-}
+```
+最终允许工具集 = 全局配置允许集 ∩ 技能声明集（若存在） ∩ 运行时策略
 ```
 
-## 5. 工具执行策略（安全与可控）
+```python
+# src/tools/permissions.py
+from ..skills.metadata import SkillMetadata
 
-### 5.1 read_file（只读）
+class PermissionChecker:
+    def __init__(self, global_allowed_tools: list[str]):
+        self._global = set(global_allowed_tools)
 
-约束：
+    def check(self, tool_name: str, skill_meta: SkillMetadata) -> bool:
+        """
+        校验工具是否被允许。
+        返回 True 表示允许执行（仍可能需要审批）。
+        返回 False 表示直接拒绝（ToolNotAllowed）。
+        """
+        # 全局配置必须允许
+        if tool_name not in self._global:
+            return False
 
-- 允许读取的根路径受控（例如限定在 repo 根目录与技能目录，或由配置列出）
-- 单次读取最大字节数限制
-- 对大文件返回摘要或片段，并提供落盘引用
+        # 技能有 allowed_tools 声明时进一步收紧
+        if skill_meta.allowed_tools:
+            if tool_name not in skill_meta.allowed_tools:
+                return False
 
-输出：
+        return True
 
-- `content_excerpt` + `sha256` + `truncated` + `storage_ref`（可选）
-
-### 5.2 list_dir（只读）
-
-约束：
-
-- 限定根路径
-- 返回条目数上限
-- 默认隐藏敏感文件（可配置）
-
-### 5.3 grep（只读）
-
-约束：
-
-- 限定根路径与文件类型
-- 结果行数上限与单行截断
-- 支持返回“仅文件列表”或“内容片段”（由参数控制）
-
-### 5.4 run_script（受控执行）
-
-核心目标：在不引入 OS 级沙箱的前提下，实现可接受的风险控制与可审计执行。
-
-#### 5.4.1 路径与来源约束
-
-- 脚本必须位于技能目录内（`<skill_dir>/scripts/...`）
-- `relative_path` 必须通过与 Skill Loader 同等级的路径越界防护（realpath 前缀校验）
-
-#### 5.4.2 进程与资源约束
-
-- 超时：例如 30s（可配置）
-- 工作目录：默认在 `.agent/runs/<run_id>/sandbox/`（隔离临时文件），必要时允许显式切换到技能目录
-- 环境变量：默认清空或只保留最小白名单（PATH 等），禁止注入敏感变量
-- 输出限制：stdout/stderr 按字符数截断，完整输出可落盘到 `observations/`
-
-#### 5.4.3 参数约束
-
-- args 必须是数组，每个元素长度受限
-- 默认禁止 shell=True；仅允许直接 exec（避免命令注入）
-- 如需执行 bash 脚本：仍以文件路径 + 参数执行，不拼接字符串命令
-
-#### 5.4.4 退出码与错误处理
-
-- exit_code != 0：返回结构化错误并附带 stdout/stderr 摘要
-- 超时：标记为 `timeout=true` 并返回摘要
-
-## 6. 输出控制：摘要、截断与落盘引用
-
-Tools Runtime 的返回值应避免把大块内容直接注入上下文，遵循：
-
-- 返回摘要（必要字段 + 关键片段）
-- 大块内容落盘到 `.agent/runs/<run_id>/observations/` 或 `artifacts/`
-- 在返回对象中提供 `storage_ref`（文件路径）与 `sha256`
-
-这与 Agent Core 的上下文裁剪策略（见 agent-core.md）配套，保证“token 可控但可回放”。
-
-## 7. 审计格式（与事件流对齐）
-
-Tools Runtime 需要产出结构化审计记录，供 Agent Core 写入 `events.jsonl`。建议字段：
-
-```json
-{
-  "tool": "run_script",
-  "risk": "medium",
-  "ts_start": "2026-02-03T12:34:56.789Z",
-  "ts_end": "2026-02-03T12:34:57.120Z",
-  "params": {"...": "..."},
-  "result": {"ok": true, "exit_code": 0, "stdout_ref": "observations/stdout_3.txt"},
-  "policy": {"approved": true, "approval_scope": "run"},
-  "hashes": {"stdout_sha256": "..."}
-}
+    def requires_approval(self, tool_name: str) -> bool:
+        """medium 及以上风险等级的工具需要审批。"""
+        return tool_name in {"run_script", "write_file", "delete_file", "network_request"}
 ```
 
-说明：
+### 3.2 授权粒度
 
-- `params` 必须可脱敏（或仅记录摘要）
-- 重要产物必须可追溯（ref + hash）
+| 粒度 | 说明 | 推荐场景 |
+|------|------|----------|
+| 单次调用 | 每次调用单独审批 | 高风险操作 |
+| 本次 run | 同工具在同一 session 内复用授权 | run_script（开发场景）|
+| 全局 | 不需要审批 | read_file 等只读工具 |
 
-## 8. 错误类型（返回给 Agent Core 作为 observation）
+---
 
-建议统一错误类型（便于模型在下一轮 Decide 中处理）：
+## 4. 审批机制
 
-- `ToolNotAllowed`
-- `ApprovalRequired`
-- `ApprovalDenied`
-- `PathTraversalBlocked`
-- `FileTooLarge`
-- `Timeout`
-- `ExitNonZero`
-- `IOError`
+```python
+# src/tools/approval.py
+from enum import Enum
 
-Agent Core 把错误作为 observation 注入上下文，并允许模型更新 Plan（例如改用只读方案、请求审批、降级输出）。
+class ApprovalScope(str, Enum):
+    ONCE = "once"           # 仅本次调用
+    RUN = "run"             # 本次 run 内
+    ALWAYS = "always"       # 不再询问（全局）
+
+class ApprovalRequest:
+    def __init__(self, tool: str, risk: str, params: dict, skill_name: str):
+        self.tool = tool
+        self.risk = risk
+        self.params = params
+        self.skill_name = skill_name
+
+class ApprovalManager:
+    """
+    交互式：向用户展示审批请求，等待 y/n 输入。
+    非交互式（CI）：自动拒绝所有需审批的工具。
+    """
+
+    def __init__(self, interactive: bool = True):
+        self._interactive = interactive
+        self._run_approvals: set[str] = set()  # 本次 run 已授权的 tool
+
+    def request(self, req: ApprovalRequest) -> bool:
+        """返回 True 表示用户批准，False 表示拒绝。"""
+        # 已在本次 run 授权
+        if req.tool in self._run_approvals:
+            return True
+
+        if not self._interactive:
+            return False  # CI 模式：自动拒绝
+
+        # 向终端展示审批请求
+        print(f"\n[Approval Required]")
+        print(f"  Tool:   {req.tool}")
+        print(f"  Risk:   {req.risk}")
+        print(f"  Skill:  {req.skill_name}")
+        print(f"  Params: {req.params}")
+        answer = input("Allow? [y/N/run(allow for this run)] ").strip().lower()
+
+        if answer == "y":
+            return True
+        elif answer == "run":
+            self._run_approvals.add(req.tool)
+            return True
+        else:
+            return False
+```
+
+---
+
+## 5. ToolsRuntime 接口
+
+```python
+# src/tools/runtime.py
+from pathlib import Path
+from ..skills.metadata import SkillMetadata
+from ..agent.events import EventLogger, EventType
+from .permissions import PermissionChecker
+from .approval import ApprovalManager, ApprovalRequest
+from .executor import ScriptExecutor, ReadFileExecutor, ListDirExecutor, GrepExecutor
+
+class ToolsRuntime:
+    """
+    工具运行时主类。
+    Agent Core 通过此类执行所有工具操作。
+    """
+
+    def __init__(
+        self,
+        event_logger: EventLogger,
+        global_allowed_tools: list[str] = None,
+        interactive: bool = True,
+    ):
+        self._logger = event_logger
+        self._permission = PermissionChecker(
+            global_allowed_tools or ["read_file", "list_dir", "grep", "run_script"]
+        )
+        self._approval = ApprovalManager(interactive=interactive)
+        self._script_executor = ScriptExecutor()
+
+    def run_script(
+        self,
+        skill_meta: SkillMetadata,
+        script: str,
+        args: list[str] = None,
+    ) -> dict:
+        """
+        执行技能脚本。
+        返回 {"exit_code": int, "stdout": str, "stderr": str, "timeout": bool}
+        """
+        # 1. 权限校验
+        if not self._permission.check("run_script", skill_meta):
+            raise ToolNotAllowedError(f"run_script not allowed for skill '{skill_meta.name}'")
+
+        # 2. 审批
+        req = ApprovalRequest(
+            tool="run_script",
+            risk="medium",
+            params={"script": script, "args": args},
+            skill_name=skill_meta.name,
+        )
+        if self._permission.requires_approval("run_script"):
+            if not self._approval.request(req):
+                raise ApprovalDeniedError("User denied script execution approval")
+
+        # 3. 路径校验
+        skill_dir = Path(skill_meta.skill_path).parent
+        script_path = self._resolve_script_path(skill_dir, script)
+
+        # 4. 执行
+        self._logger.emit(EventType.SCRIPT_STARTED, {
+            "skill": skill_meta.name, "script": script, "args": args
+        })
+
+        result = self._script_executor.run(
+            script_path=script_path,
+            args=args or [],
+            timeout=skill_meta.resource_limits.max_script_time_sec,
+            cwd=str(skill_dir),
+        )
+
+        self._logger.emit(EventType.SCRIPT_COMPLETED, {
+            "exit_code": result["exit_code"],
+            "stdout_chars": len(result["stdout"]),
+            "timeout": result["timeout"],
+        })
+
+        return result
+
+    def read_file(self, path: str, max_bytes: int = 100_000) -> dict:
+        """读取文件内容（只读，无需审批）。"""
+        return ReadFileExecutor().run(Path(path), max_bytes=max_bytes)
+
+    def list_dir(self, path: str, max_entries: int = 100) -> dict:
+        """列出目录内容（只读，无需审批）。"""
+        return ListDirExecutor().run(Path(path), max_entries=max_entries)
+
+    def grep(self, pattern: str, path: str, max_results: int = 50) -> dict:
+        """文本搜索（只读，无需审批）。"""
+        return GrepExecutor().run(pattern=pattern, root=Path(path), max_results=max_results)
+
+    def _resolve_script_path(self, skill_dir: Path, script: str) -> Path:
+        """校验脚本路径在技能目录内。"""
+        if ".." in script or script.startswith("/"):
+            raise PathTraversalError(f"Invalid script path: {script!r}")
+
+        resolved = (skill_dir / script).resolve()
+        if not str(resolved).startswith(str(skill_dir.resolve())):
+            raise PathTraversalError(f"Script path escapes skill directory: {script!r}")
+
+        if not resolved.exists():
+            raise ScriptNotFoundError(f"Script not found: {script}")
+
+        return resolved
+```
+
+---
+
+## 6. ScriptExecutor（受控执行）
+
+```python
+# src/tools/executor.py
+import subprocess
+from pathlib import Path
+
+# 输出截断阈值
+MAX_OUTPUT_CHARS = 10_000
+
+class ScriptExecutor:
+    """
+    受控执行脚本（subprocess，非 shell=True）。
+    约束：超时 / 输出截断 / 禁止 shell 注入 / 环境变量清理。
+    """
+
+    # 最小白名单环境变量
+    _ENV_WHITELIST = {"PATH", "HOME", "USER", "LANG", "LC_ALL"}
+
+    def run(
+        self,
+        script_path: Path,
+        args: list[str],
+        timeout: int = 30,
+        cwd: str = None,
+    ) -> dict:
+        """
+        执行脚本，返回：
+        {"exit_code": int, "stdout": str, "stderr": str, "timeout": bool}
+        """
+        # 仅保留白名单环境变量
+        import os
+        clean_env = {k: v for k, v in os.environ.items() if k in self._ENV_WHITELIST}
+
+        cmd = [str(script_path)] + [str(a) for a in args]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+                env=clean_env,
+                # 禁止 shell=True，避免注入
+            )
+            stdout = proc.stdout[:MAX_OUTPUT_CHARS]
+            stderr = proc.stderr[:MAX_OUTPUT_CHARS]
+            return {
+                "exit_code": proc.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "timeout": False,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Script timed out after {timeout}s",
+                "timeout": True,
+            }
+```
+
+---
+
+## 7. 执行结果格式（供 Agent Core 注入上下文）
+
+成功执行：
+```
+[Script: scripts/fill.py | skill=pdf-form-filler]
+exit_code=0
+stdout:
+...（最多 10000 字符）...
+```
+
+执行失败：
+```
+[Script: scripts/fill.py | skill=pdf-form-filler]
+exit_code=1  stderr: "ModuleNotFoundError: No module named 'pdfplumber'"
+stdout: (empty)
+```
+
+超时：
+```
+[Script: scripts/fill.py | skill=pdf-form-filler]
+timeout=True (limit=30s)
+stdout: (empty)
+```
+
+---
+
+## 8. 错误类型
+
+```python
+class ToolsRuntimeError(Exception): pass
+class ToolNotAllowedError(ToolsRuntimeError): pass
+class ApprovalDeniedError(ToolsRuntimeError): pass
+class PathTraversalError(ToolsRuntimeError): pass
+class ScriptNotFoundError(ToolsRuntimeError): pass
+```
+
+| 错误 | Agent Core 处理 |
+|------|-----------------|
+| `ToolNotAllowedError` | 返回 error observation，模型选择只读替代方案 |
+| `ApprovalDeniedError` | 返回 "User denied" observation，模型更新 Plan |
+| `PathTraversalError` | 返回 error observation，模型修正路径 |
+| `ScriptNotFoundError` | 返回 error observation，模型检查技能结构 |
+| `exit_code != 0` | 返回 exit_code + stderr，模型走失败分支 |
+| `timeout=True` | 返回 timeout observation，模型更新 Plan |
+
+---
+
+## 9. 验收标准
+
+### Phase B
+
+- [ ] `run_script` 执行测试脚本（`echo hello`），返回 `exit_code=0, stdout="hello\n"`
+- [ ] 超时测试：`sleep 60` 在 5s timeout 后返回 `timeout=True`
+- [ ] 路径越界：`script="../secret.py"` 抛出 `PathTraversalError`
+- [ ] 权限拒绝：技能 `allowed_tools=["read_file"]` 时 `run_script` 抛出 `ToolNotAllowedError`
+- [ ] 非交互模式（CI）：需审批的工具自动返回 `ApprovalDeniedError`
+- [ ] 执行结果超 10000 字符时截断，不崩溃
+
+---
+
+## 10. 设计权衡说明
+
+| 决策点 | 选择 | 替代方案 | 选择理由 |
+|--------|------|----------|----------|
+| 脚本执行方式 | `subprocess.run(shell=False)` | `shell=True` | 防止命令注入；直接 exec 无 shell 介入 |
+| OS 级沙箱 | 不引入 | Docker / seccomp | MVP 阶段复杂度过高；路径约束 + 超时已覆盖核心风险 |
+| 环境变量 | 白名单清理 | 全量继承 | 防止脚本意外读取 ANTHROPIC_API_KEY 等敏感变量 |
+| 输出截断 | 截断至 10000 chars | 全量落盘 | 上下文注入有大小限制；完整输出可另行落盘 |
+| 审批粒度 | 单次 or run 级 | 全局授权 | 全局授权风险过高；run 级覆盖开发场景的便利需求 |

@@ -1,168 +1,316 @@
 # Skill Loader 设计
 
-本文档细化 Skill Loader（技能加载器）的设计：SKILL.md 正文加载、资源按需读取、渐进式披露策略、大小/行数限制、注入上下文格式、以及安全与落盘协作。整体协作参见：[agent-core.md](file:///Users/peng/Me/Ai/skills-agent/docs/design/agent-core.md) 与总览 [agent-skills-tech-design.md](file:///Users/peng/Me/Ai/skills-agent/docs/agent-skills-tech-design.md)。
+**状态**：Phase A 完整实现
 
-## 1. 系统定位与职责边界
+---
 
-Skill Loader 是“按需内容加载层”，其核心目标是实现 Skills 的渐进式披露（Level 2/3），并保证：
+## 1. 设计目标
 
-- 只加载被选中的技能正文（Level 2），未触发技能的正文不得读取
-- 资源文件按动作精确读取（Level 3），不做全量扫描与全量加载
-- 输出受控：避免把大块资源塞进上下文，优先摘要与片段
-- 安全受控：防止路径穿越、符号链接逃逸、越界读取
+Skill Loader 是"按需内容加载层"，实现 Skills 渐进式披露的 Level 2（SKILL.md 正文）和 Level 3（资源文件片段）。
 
-不在 Skill Loader 内处理：
+**核心职责**：
+- 解析并剥离 YAML 前言，返回 SKILL.md 的 Markdown 正文
+- 按结构化动作精确读取资源文件（`reference/`、`assets/` 等）
+- 强制路径越界防护（禁止 `..`、禁止符号链接逃逸）
+- 输出受控：正文和资源片段大小有上限，超限截断
 
-- 技能发现与元数据索引（由 Skill Registry 负责）
-- 权限合并与审批（由 Tools Runtime / Agent Core 负责）
-- 模型交互与结构化动作解析（由 Model Adapter 负责）
+**不在此处理**：
+- 技能发现与元数据索引（Skill Registry 负责）
+- 权限合并与审批（Tools Runtime 负责）
+- 模型通信（Model Adapter 负责）
 
-## 2. 输入输出与接口契约（非代码约定）
+---
 
-### 2.1 输入
+## 2. 渐进式披露层次
 
-- `skill_ref`：技能引用（name/source/path），由 Skill Registry 提供
-- `relative_path`：资源相对路径（例如 `reference/kpi.md`），来自结构化动作
-- `section_hint`：可选章节提示（例如 `## 指标定义`），用于片段截取
-- `limits`：加载限制（最大行数/最大字符数/最大文件大小等）
+| 层级 | 触发时机 | 加载内容 | 负责方 |
+|------|----------|----------|--------|
+| Level 1 | Agent 启动 | 元数据（name/description/source） | Skill Registry |
+| Level 2 | LOAD_SKILL 动作 | SKILL.md 正文（去除前言） | **Skill Loader** |
+| Level 3 | LOAD_RESOURCE 动作 | 资源文件片段 | **Skill Loader** |
 
-### 2.2 输出
+---
 
-- `skill_body`：SKILL.md 正文文本（去除 YAML 前言）
-- `resource_excerpt`：资源片段或摘要（优先摘要 + 引用指向）
-- `load_report`：结构化加载报告（路径、大小、裁剪策略、哈希、引用文件）
+## 3. SkillLoader 接口
 
-### 2.3 核心接口（建议）
+```python
+# src/skills/loader.py
+from pathlib import Path
+from typing import Optional
+from .metadata import SkillMetadata
+from .frontmatter import FrontmatterParser
+from ..common.security import validate_path_within_root
 
-- `load_skill_body(skill_ref, limits) -> {text, report}`
-- `load_resource(skill_ref, relative_path, section_hint?, limits) -> {text_or_excerpt, report}`
+class LoadReport(dict):
+    """加载报告（作为 dict 传入 EventLogger.data）"""
+    # 包含字段：sha256, bytes_read, chars_returned, truncated, storage_ref
 
-## 3. 渐进式披露实现策略
+class SkillLoader:
+    """
+    技能内容加载器。
+    Level 2：load_body()     → SKILL.md 正文（去前言）
+    Level 3：load_resource() → 资源文件片段
+    """
 
-Skill Loader 只实现 Level 2/3；Level 1（元数据）由 Skill Registry 完成。
+    # 正文大小限制
+    MAX_BODY_LINES = 500
+    MAX_BODY_CHARS = 40_000
 
-### 3.1 Level 2：加载 SKILL.md 正文
+    # 资源文件大小限制
+    MAX_RESOURCE_BYTES = 2_000_000
+    MAX_RESOURCE_EXCERPT_CHARS = 12_000
 
-加载规则：
+    def __init__(self):
+        pass
 
-- 读取 `<skill_dir>/SKILL.md`
-- 解析并剥离 YAML 前言，只返回 Markdown 正文
-- 如果正文超过阈值：拒绝或裁剪，并要求技能作者拆分到 `reference/`（具体策略见 5.2）
+    def load_body(self, meta: SkillMetadata) -> tuple[str, LoadReport]:
+        """
+        加载 SKILL.md 正文（Level 2）。
+        - 解析并剥离 YAML 前言
+        - 超过大小限制时截断（保留开头），标记 truncated=True
+        - 返回 (body_text, report)
+        """
+        skill_dir = Path(meta.skill_path).parent
+        skill_md = Path(meta.skill_path)
 
-注入建议（供 Agent Core 使用）：
+        raw = skill_md.read_text(encoding="utf-8")
+        _, body = FrontmatterParser._split(raw)
 
-- 在上下文中以“技能块”形式注入：
-  - skill identity：name/source/path
-  - 关键约束：allowed-tools/disable-model-invocation（由 Registry 提供）
-  - skill body：可能裁剪后的正文
+        truncated = False
+        lines = body.split("\n")
 
-### 3.2 Level 3：按需加载资源文件
+        if len(lines) > self.MAX_BODY_LINES:
+            body = "\n".join(lines[:self.MAX_BODY_LINES])
+            body += f"\n\n[...正文超过 {self.MAX_BODY_LINES} 行，已截断。完整内容请通过 load_resource 按需读取。]"
+            truncated = True
+        elif len(body) > self.MAX_BODY_CHARS:
+            body = body[:self.MAX_BODY_CHARS]
+            body += "\n\n[...正文超过字符限制，已截断。]"
+            truncated = True
 
-资源加载必须由结构化动作显式触发（`load_resource`），并且：
+        import hashlib
+        sha256 = hashlib.sha256(body.encode()).hexdigest()
 
-- 只允许在技能目录内读取（`skill_dir` 作为根）
-- 只读取单个文件（由 `relative_path` 指定），不允许 glob
-- 默认返回片段/摘要而不是全量（避免上下文膨胀）
+        report = LoadReport(
+            sha256=sha256,
+            bytes_read=len(raw.encode()),
+            chars_returned=len(body),
+            truncated=truncated,
+            storage_ref=None,
+        )
+        return body, report
 
-section_hint 行为：
+    def load_resource(
+        self,
+        meta: SkillMetadata,
+        relative_path: str,
+        section_hint: Optional[str] = None,
+        max_excerpt_chars: int = None,
+    ) -> tuple[str, LoadReport]:
+        """
+        加载资源文件片段（Level 3）。
+        - relative_path 必须在技能目录内（严格路径校验）
+        - 若提供 section_hint，截取该章节内容
+        - 超过大小限制时截断
+        - 返回 (excerpt_text, report)
+        """
+        max_chars = max_excerpt_chars or self.MAX_RESOURCE_EXCERPT_CHARS
+        skill_dir = Path(meta.skill_path).parent
 
-- 若提供章节标题：尝试从该标题开始截取到下一个同级标题，最多截取 `max_excerpt_chars`
-- 若不提供：默认取文件开头或关键区域（例如 Contents/Overview），同样受上限限制
+        # 路径安全校验
+        abs_path = self._resolve_safe(skill_dir, relative_path)
 
-## 4. 安全模型（必须）
+        if abs_path.stat().st_size > self.MAX_RESOURCE_BYTES:
+            raise FileTooLargeError(
+                f"Resource file too large: {relative_path} "
+                f"({abs_path.stat().st_size} bytes > {self.MAX_RESOURCE_BYTES})"
+            )
 
-### 4.1 路径越界防护
+        content = abs_path.read_text(encoding="utf-8", errors="replace")
 
-对 `relative_path` 必须做严格校验：
+        # 提取章节（若有 section_hint）
+        if section_hint:
+            content = self._extract_section(content, section_hint) or content[:max_chars]
 
-- 禁止 `..` 路径段
-- 禁止绝对路径
-- 计算 `resolved_path = realpath(skill_dir / relative_path)` 后要求其前缀为 `realpath(skill_dir)`
-- 禁止跟随符号链接越界（realpath 可解决大部分，仍建议对每级路径做一致性检查）
+        truncated = False
+        if len(content) > max_chars:
+            content = content[:max_chars]
+            content += f"\n\n[...已截断至 {max_chars} 字符]"
+            truncated = True
 
-### 4.2 允许读取的文件类型（可选增强）
+        import hashlib
+        sha256 = hashlib.sha256(content.encode()).hexdigest()
 
-MVP 可先允许任意文本文件读取，但建议预留配置：
+        report = LoadReport(
+            sha256=sha256,
+            bytes_read=abs_path.stat().st_size,
+            chars_returned=len(content),
+            truncated=truncated,
+            storage_ref=None,
+        )
+        return content, report
 
-- 默认允许：`.md` `.txt` `.json` `.yaml` `.yml`
-- 默认拒绝：二进制/可执行/超大文件
+    def _resolve_safe(self, skill_dir: Path, relative_path: str) -> Path:
+        """
+        解析资源路径，确保在技能目录内。
+        防止路径穿越（..）和符号链接逃逸。
+        """
+        if ".." in relative_path or relative_path.startswith("/"):
+            raise PathTraversalError(f"Invalid relative path: {relative_path!r}")
 
-### 4.3 敏感信息与落盘协作
+        resolved = (skill_dir / relative_path).resolve()
+        skill_dir_resolved = skill_dir.resolve()
 
-Skill Loader 返回的 `report` 应包含：
+        if not str(resolved).startswith(str(skill_dir_resolved)):
+            raise PathTraversalError(
+                f"Path traversal detected: {relative_path!r} escapes skill directory"
+            )
 
-- `sha256`（内容哈希或片段哈希）
-- `bytes_read` / `chars_returned`
-- `truncated`（是否裁剪）
-- `storage_ref`（若大块内容落盘，返回引用路径）
+        if not resolved.exists():
+            raise ResourceNotFoundError(f"Resource not found: {relative_path}")
 
-Agent Core 可据此把“资源大块内容”落盘到 `.agent/runs/<run_id>/observations/`，并在上下文只保留摘要 + `storage_ref`。
+        return resolved
 
-## 5. 输出控制：裁剪与摘要策略
+    def _extract_section(self, content: str, section_hint: str) -> Optional[str]:
+        """
+        从 Markdown 内容中提取指定章节（标题行到下一同级标题之间的内容）。
+        section_hint 示例：'## 指标定义' 或 '指标定义'
+        """
+        lines = content.split("\n")
+        start_idx = None
+        hint = section_hint.lstrip("#").strip()
 
-### 5.1 为什么必须输出控制
+        for i, line in enumerate(lines):
+            if hint in line and line.startswith("#"):
+                start_idx = i
+                level = len(line) - len(line.lstrip("#"))
+                break
 
-Skills 机制在设计上允许技能目录包含大量参考资料，Skill Loader 必须保证“按需加载 + 输出受控”，否则 ReAct 循环会快速累积上下文，导致 token 过长。
+        if start_idx is None:
+            return None
 
-### 5.2 SKILL.md 正文策略（Level 2）
+        # 找到下一个同级或更高级别的标题
+        end_idx = len(lines)
+        for i in range(start_idx + 1, len(lines)):
+            if lines[i].startswith("#"):
+                cur_level = len(lines[i]) - len(lines[i].lstrip("#"))
+                if cur_level <= level:
+                    end_idx = i
+                    break
 
-建议默认限制：
-
-- `max_skill_body_lines = 500`
-- `max_skill_body_chars = 40_000`（或由配置控制）
-
-超限处理（优先级）：
-
-1. 拒绝加载，并在报告中提示：将长内容拆分到 `reference/` 并在正文中索引
-2. 或裁剪加载：保留开头的概览/目录 + 关键步骤段落，并明确标注 `truncated=true`
-
-裁剪原则：
-
-- 保留“触发条件、步骤、验收、自检、资源索引”等关键段
-- 丢弃“冗长背景材料、重复示例”，改为引用 `reference/*` 路径
-
-### 5.3 资源文件策略（Level 3）
-
-建议默认限制：
-
-- `max_resource_file_bytes = 2_000_000`
-- `max_resource_excerpt_chars = 12_000`
-
-输出方式：
-
-- 默认返回片段（excerpt）而不是全文
-- 若模型明确要求全文：仍需要上限；超过上限则落盘并在上下文提供分段读取建议
-
-## 6. 注入上下文格式（供 Agent Core 复用）
-
-Skill Loader 建议提供统一的“注入块”模板，便于 Agent Core 拼装上下文并支持审计：
-
-```text
-[Skill: <name> | source=<source>]
-[Skill Path: <path>]
-[Load Report: sha256=<...> truncated=<true|false> bytes_read=<...>]
-<skill body or resource excerpt>
+        return "\n".join(lines[start_idx:end_idx])
 ```
 
-其中 `<skill body or resource excerpt>` 必须是“已受控输出”的文本。
+---
 
-## 7. 与 Model Adapter 的协作点（流式解析不影响加载语义）
+## 4. 路径安全模型
 
-即使引入“结构化 JSON token 级流式解析”，Skill Loader 的语义也不改变：
+### 4.1 校验流程
 
-- Model Adapter 负责从流式 JSON 中尽早解析出 `action.type` 与 `relative_path`
-- Agent Core 可以提前回显“即将加载哪个技能/哪个资源”
-- 但实际读取仍发生在本轮动作被完整校验通过之后（避免流式阶段的半成品指令触发 IO）
+```
+relative_path（来自模型的结构化动作）
+    │
+    ├── 禁止包含 '..'
+    ├── 禁止以 '/' 开头（绝对路径）
+    │
+    ▼
+abs_path = (skill_dir / relative_path).resolve()
+    │
+    ├── resolve() 解析所有符号链接
+    ├── 要求 str(abs_path).startswith(str(skill_dir.resolve()))
+    └── 不满足 → 抛出 PathTraversalError
+```
 
-## 8. 失败处理
+### 4.2 允许的文件类型
 
-Skill Loader 的失败应返回结构化错误（由 Agent Core 记录为 observation）：
+MVP 阶段不限制文件类型，但二进制文件以 `errors="replace"` 读取（不抛出）。后续可扩展为白名单：`.md .txt .json .yaml .yml`。
 
-- `SkillNotFound`：技能目录不存在或 SKILL.md 缺失
-- `InvalidFrontmatter`：SKILL.md 前言无法解析（若 Loader 需要复核）
-- `PathTraversalBlocked`：检测到越界路径
-- `FileTooLarge`：超过大小阈值
-- `SectionNotFound`：section_hint 未命中（可降级为文件开头片段）
-- `IOError`：读取失败（权限/不存在/编码异常）
+---
 
-Agent Core 在下一轮 Decide 中将错误作为 observation 提供给模型，让模型更新 Plan 或选择替代路径。
+## 5. 输出格式（供 Agent Core 注入上下文）
+
+### Level 2（技能正文块）
+
+```
+[Skill: pdf-form-filler | source=project]
+[Load Report: sha256=abc123 truncated=false chars=2048]
+
+# PDF Form Filler
+
+...（SKILL.md 正文内容）...
+```
+
+### Level 3（资源片段块）
+
+```
+[Resource: reference/kpi.md | skill=pdf-form-filler]
+[Load Report: sha256=def456 truncated=true chars=12000]
+
+## 指标定义
+
+...（章节内容）...
+[...已截断至 12000 字符]
+```
+
+---
+
+## 6. 错误类型
+
+| 错误 | 场景 | Agent Core 处理 |
+|------|------|-----------------|
+| `PathTraversalError` | `..` 或逃逸路径 | 返回 error observation，模型改路径 |
+| `ResourceNotFoundError` | 文件不存在 | 返回 error observation |
+| `FileTooLargeError` | 超过 2MB 限制 | 返回 error observation，建议分段读取 |
+| `SectionNotFoundError` | section_hint 未命中 | 降级为文件开头片段 |
+| `UnicodeDecodeError` | 二进制文件 | `errors="replace"` 读取，不抛出 |
+
+```python
+class SkillLoaderError(Exception): pass
+class PathTraversalError(SkillLoaderError): pass
+class ResourceNotFoundError(SkillLoaderError): pass
+class FileTooLargeError(SkillLoaderError): pass
+class SectionNotFoundError(SkillLoaderError): pass
+```
+
+---
+
+## 7. 大块内容落盘协作
+
+当资源内容超过上下文注入阈值时，Agent Core 可将完整内容落盘：
+
+```python
+# Agent Core 侧（伪代码）
+excerpt, report = loader.load_resource(meta, "reference/large-doc.md")
+
+if report["chars_returned"] >= STORAGE_THRESHOLD:
+    # 落盘到 observations/
+    storage_ref = event_logger.save_blob(excerpt, suffix=".md")
+    report["storage_ref"] = storage_ref
+
+# 注入上下文时只用摘要，完整内容通过 storage_ref 可追溯
+obs_text = f"[Resource: reference/large-doc.md | truncated=True | ref={storage_ref}]\n{excerpt[:500]}..."
+```
+
+---
+
+## 8. 验收标准
+
+- [ ] `load_body()` 返回去除 YAML 前言的正文，`report["sha256"]` 非空
+- [ ] 正文超过 500 行时截断，`report["truncated"] == True`
+- [ ] `load_resource()` 成功读取 `reference/test.md` 并返回内容
+- [ ] `section_hint="## 指标定义"` 正确截取对应章节
+- [ ] `relative_path="../secret.txt"` 抛出 `PathTraversalError`
+- [ ] `relative_path="/etc/passwd"` 抛出 `PathTraversalError`
+- [ ] 文件不存在时抛出 `ResourceNotFoundError`
+
+---
+
+## 9. 设计权衡说明
+
+| 决策点 | 选择 | 替代方案 | 选择理由 |
+|--------|------|----------|----------|
+| 正文超限策略 | 截断（保留开头） | 拒绝加载 | 保留技能概述和步骤摘要，不完全丢弃 |
+| section_hint 未命中 | 降级为文件开头 | 抛出错误 | 宽容策略，优先给模型有用信息 |
+| 路径校验方式 | realpath 前缀比较 | 黑名单字符过滤 | realpath 正确处理符号链接，更安全 |
+| 资源片段大小 | 12000 chars | 更大/更小 | 约 3000 tokens，在上下文中合理；更大则单次 observation 占比过高 |
+| 读取错误处理 | errors="replace" | 严格 UTF-8 | 技能中可能含非 UTF-8 资源，宽容读取避免崩溃 |
