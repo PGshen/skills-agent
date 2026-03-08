@@ -108,7 +108,7 @@ A0.1（项目结构）
 | A1.3 | Event（事件）数据结构 | ✅ 已完成 | |
 | A1.4 | AgentState（Agent 状态）数据结构 | ✅ 已完成 | |
 | A1.5 | OutputSink 接口与 NullSink | ✅ 已完成 | |
-| A2.1 | SKILL.md Frontmatter 解析器 | ⬜ 待开始 | |
+| A2.1 | SKILL.md Frontmatter 解析器 | ✅ 已完成 | |
 | A2.2 | Skill Registry（技能注册与索引） | ⬜ 待开始 | |
 | A2.3 | Skill Loader（技能内容加载器） | ⬜ 待开始 | |
 | A3.1 | MockModel | ⬜ 待开始 | |
