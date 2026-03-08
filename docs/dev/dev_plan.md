@@ -102,12 +102,12 @@ A0.1（项目结构）
 
 | 任务 | 名称 | 状态 | 备注 |
 |------|------|------|------|
-| A0.1 | 创建项目结构与配置 | ⬜ 待开始 | |
-| A1.1 | SkillMetadata 数据结构 | ⬜ 待开始 | |
-| A1.2 | Plan、Step、Action 数据结构 | ⬜ 待开始 | |
-| A1.3 | Event（事件）数据结构 | ⬜ 待开始 | |
-| A1.4 | AgentState（Agent 状态）数据结构 | ⬜ 待开始 | |
-| A1.5 | OutputSink 接口与 NullSink | ⬜ 待开始 | |
+| A0.1 | 创建项目结构与配置 | ✅ 已完成 | |
+| A1.1 | SkillMetadata 数据结构 | ✅ 已完成 | |
+| A1.2 | Plan、Step、Action 数据结构 | ✅ 已完成 | |
+| A1.3 | Event（事件）数据结构 | ✅ 已完成 | |
+| A1.4 | AgentState（Agent 状态）数据结构 | ✅ 已完成 | |
+| A1.5 | OutputSink 接口与 NullSink | ✅ 已完成 | |
 | A2.1 | SKILL.md Frontmatter 解析器 | ⬜ 待开始 | |
 | A2.2 | Skill Registry（技能注册与索引） | ⬜ 待开始 | |
 | A2.3 | Skill Loader（技能内容加载器） | ⬜ 待开始 | |

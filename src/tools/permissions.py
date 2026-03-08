@@ -1,0 +1,1 @@
+"""Permission merging and enforcement."""

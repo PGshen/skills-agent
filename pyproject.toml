@@ -3,15 +3,22 @@ name = "skills-agent"
 version = "0.1.0"
 description = "Agent Skills System - Python Native Implementation"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "PyYAML>=6.0",
+    "requests>=2.31.0",
+    "pydantic>=2.0",
+]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.4.0",
+    "pytest>=8.0",
     "pytest-cov>=4.1.0",
     "ruff>=0.1.0",
     "mypy>=1.5.0",
 ]
+
+[project.scripts]
+skills-agent = "cli.main:main"
 
 [build-system]
 requires = ["hatchling"]
