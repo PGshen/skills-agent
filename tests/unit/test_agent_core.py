@@ -481,11 +481,11 @@ class TestContextAssembly:
 
 
 # ---------------------------------------------------------------------------
-# Tests: RUN_SCRIPT in Phase A
+# Tests: RUN_SCRIPT without ToolsRuntime (tools=None)
 # ---------------------------------------------------------------------------
 
 class TestRunScript:
-    def test_run_script_returns_error_in_phase_a(self, tmp_path):
+    def test_run_script_returns_error_when_tools_not_configured(self, tmp_path):
         actions = [
             Action(type=ActionType.RUN_SCRIPT, params={
                 "skill_name": "example-skill",
@@ -495,12 +495,29 @@ class TestRunScript:
             Action(type=ActionType.FINAL_ANSWER, params={"content": "gave up"}),
         ]
         model = MockModel(actions)
-        core = make_core(model, tmp_path)
+        core = make_core(model, tmp_path)  # no tools= → tools is None
         core.run("run script test")
 
         second_messages = model.call_history[1]
         obs = next(m for m in second_messages if "Observation:" in m.get("content", ""))
         assert "Error: script execution not enabled" in obs["content"]
+
+    def test_run_script_no_tools_emits_action_failed(self, tmp_path):
+        actions = [
+            Action(type=ActionType.RUN_SCRIPT, params={
+                "skill_name": "example-skill",
+                "script": "run.sh",
+            }),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = make_core(model, tmp_path)
+        core.run("test")
+
+        events = read_events(tmp_path)
+        failed = events_of_type(events, "action_failed")
+        assert len(failed) == 1
+        assert failed[0]["data"]["reason"] == "tools_not_configured"
 
 
 # ---------------------------------------------------------------------------
@@ -702,3 +719,197 @@ class TestEdgeCases:
         assert "[Skill: example-skill]" in obs["content"]
         # The fixture skill body contains "This is the body of the example skill"
         assert "Example Skill" in obs["content"] or "example skill" in obs["content"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests: RUN_SCRIPT permission enforcement (B2.1)
+# ---------------------------------------------------------------------------
+
+import stat
+from tools.runtime import ToolsRuntime
+
+
+def _write_skill(base: Path, name: str, allowed_tools: list[str], extra_yaml: str = "") -> Path:
+    """Write a minimal SKILL.md in a skill directory under *base*."""
+    skill_dir = base / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    if allowed_tools:
+        tools_yaml = "allowed-tools:\n" + "\n".join(f"  - {t}" for t in allowed_tools) + "\n"
+    else:
+        tools_yaml = "allowed-tools: []\n"
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: test\n{tools_yaml}{extra_yaml}---\nBody.\n"
+    )
+    return skill_dir
+
+
+def _write_executable_script(skill_dir: Path, name: str, content: str) -> Path:
+    p = skill_dir / name
+    p.write_text(content)
+    p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return p
+
+
+def _make_core_with_tools(
+    model: MockModel,
+    tmp_path: Path,
+    registry: SkillRegistry,
+    global_tools: list[str] = None,
+    preapprove: bool = False,
+) -> AgentCore:
+    logger = make_logger(tmp_path)
+    tools = ToolsRuntime(
+        global_allowed_tools=global_tools or ["read_file", "list_dir", "grep", "run_script"],
+        interactive=False,
+    )
+    if preapprove:
+        tools._approval._run_approvals.add("run_script")
+    return AgentCore(
+        model=model,
+        registry=registry,
+        loader=SkillLoader(),
+        event_logger=logger,
+        tools=tools,
+        max_turns=20,
+    )
+
+
+class TestRunScriptPermissions:
+    """B2.1: permission enforcement for RUN_SCRIPT in AgentCore."""
+
+    def _registry(self, base: Path) -> SkillRegistry:
+        return SkillRegistry([{"source": "project", "path": str(base), "priority": 0}])
+
+    def test_permission_denied_when_skill_lacks_run_script(self, tmp_path):
+        """Skill without run_script in allowed_tools → ToolNotAllowed + ACTION_FAILED."""
+        skill_dir = _write_skill(tmp_path / "skills", "no-script-skill", allowed_tools=["read_file"])
+        registry = self._registry(tmp_path / "skills")
+
+        actions = [
+            Action(type=ActionType.LOAD_SKILL, params={"skill_name": "no-script-skill"}),
+            Action(type=ActionType.RUN_SCRIPT, params={
+                "skill_name": "no-script-skill",
+                "script": "run.sh",
+            }),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "gave up"}),
+        ]
+        model = MockModel(actions)
+        core = _make_core_with_tools(model, tmp_path, registry)
+        core.run("test")
+
+        # call_history[2] = messages for FINAL_ANSWER turn; last observation is from RUN_SCRIPT
+        third_messages = model.call_history[2]
+        obs_msgs = [m for m in third_messages if "Observation:" in m.get("content", "")]
+        obs = obs_msgs[-1]  # last observation = from RUN_SCRIPT
+        assert "ToolNotAllowed" in obs["content"]
+
+        events = read_events(tmp_path)
+        failed = events_of_type(events, "action_failed")
+        assert any(e["data"]["reason"] == "permission_denied" for e in failed)
+
+    def test_permission_granted_when_skill_has_run_script(self, tmp_path):
+        """Skill with allowed_tools=[run_script] → script executes and stdout in observation."""
+        skill_dir = _write_skill(
+            tmp_path / "skills", "script-skill", allowed_tools=["run_script"]
+        )
+        _write_executable_script(skill_dir, "greet.sh", "#!/bin/sh\necho hello_from_script\n")
+        registry = self._registry(tmp_path / "skills")
+
+        actions = [
+            Action(type=ActionType.LOAD_SKILL, params={"skill_name": "script-skill"}),
+            Action(type=ActionType.RUN_SCRIPT, params={
+                "skill_name": "script-skill",
+                "script": "greet.sh",
+                "args": [],
+            }),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = _make_core_with_tools(model, tmp_path, registry, preapprove=True)
+        core.run("test")
+
+        third_messages = model.call_history[2]
+        obs_msgs = [m for m in third_messages if "Observation:" in m.get("content", "")]
+        obs = obs_msgs[-1]  # last observation = from RUN_SCRIPT
+        assert "hello_from_script" in obs["content"]
+        assert "returncode=0" in obs["content"]
+
+    def test_skill_not_loaded_gives_skill_not_loaded_error(self, tmp_path):
+        """RUN_SCRIPT without prior LOAD_SKILL → skill_not_loaded ACTION_FAILED."""
+        _write_skill(tmp_path / "skills", "orphan-skill", allowed_tools=["run_script"])
+        registry = self._registry(tmp_path / "skills")
+
+        actions = [
+            Action(type=ActionType.RUN_SCRIPT, params={
+                "skill_name": "orphan-skill",
+                "script": "run.sh",
+            }),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = _make_core_with_tools(model, tmp_path, registry, preapprove=True)
+        core.run("test")
+
+        second_messages = model.call_history[1]
+        obs = next(m for m in second_messages if "Observation:" in m.get("content", ""))
+        assert "not loaded" in obs["content"].lower() or "ToolNotAllowed" in obs["content"]
+
+        events = read_events(tmp_path)
+        failed = events_of_type(events, "action_failed")
+        assert any(e["data"]["reason"] == "skill_not_loaded" for e in failed)
+
+    def test_global_config_blocks_run_script(self, tmp_path):
+        """Global config without run_script → ToolNotAllowed even if skill allows it."""
+        skill_dir = _write_skill(
+            tmp_path / "skills", "full-skill", allowed_tools=["run_script"]
+        )
+        registry = self._registry(tmp_path / "skills")
+
+        actions = [
+            Action(type=ActionType.LOAD_SKILL, params={"skill_name": "full-skill"}),
+            Action(type=ActionType.RUN_SCRIPT, params={
+                "skill_name": "full-skill",
+                "script": "run.sh",
+            }),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = _make_core_with_tools(
+            model, tmp_path, registry, global_tools=["read_file"]
+        )
+        core.run("test")
+
+        third_messages = model.call_history[2]
+        obs_msgs = [m for m in third_messages if "Observation:" in m.get("content", "")]
+        obs = obs_msgs[-1]  # last observation = from RUN_SCRIPT
+        assert "ToolNotAllowed" in obs["content"]
+
+    def test_timed_out_script_returns_observation_and_action_failed(self, tmp_path):
+        """Script exceeding time limit → ScriptTimedOut observation + ACTION_FAILED."""
+        skill_dir = _write_skill(
+            tmp_path / "skills", "slow-skill", allowed_tools=["run_script"],
+            extra_yaml="resource-limits:\n  max-script-time-sec: 1\n",
+        )
+        _write_executable_script(skill_dir, "slow.sh", "#!/bin/sh\nsleep 60\n")
+        registry = self._registry(tmp_path / "skills")
+
+        actions = [
+            Action(type=ActionType.LOAD_SKILL, params={"skill_name": "slow-skill"}),
+            Action(type=ActionType.RUN_SCRIPT, params={
+                "skill_name": "slow-skill",
+                "script": "slow.sh",
+            }),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = _make_core_with_tools(model, tmp_path, registry, preapprove=True)
+        core.run("test")
+
+        third_messages = model.call_history[2]
+        obs_msgs = [m for m in third_messages if "Observation:" in m.get("content", "")]
+        obs = obs_msgs[-1]  # last observation = from RUN_SCRIPT
+        assert "ScriptTimedOut" in obs["content"] or "timed" in obs["content"].lower()
+
+        events = read_events(tmp_path)
+        failed = events_of_type(events, "action_failed")
+        assert any(e["data"]["reason"] == "timed_out" for e in failed)

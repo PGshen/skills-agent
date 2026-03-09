@@ -12,6 +12,11 @@ from output.sink import NullSink, OutputSink
 from skills.loader import PathTraversalError, SkillLoader
 from skills.metadata import SkillMetadata
 from skills.registry import SkillRegistry
+from tools.runtime import (
+    ApprovalDeniedError,
+    ToolNotAllowedError,
+    ToolsRuntimeError,
+)
 
 SYSTEM_PROMPT_TEMPLATE = """\
 你是一个 AI Agent，通过 ReAct 循环（推理 → 行动 → 观察）完成用户任务。
@@ -235,8 +240,7 @@ class AgentCore:
             return f"[Resource: {resource}]\n{excerpt}"
 
         elif action.type == ActionType.RUN_SCRIPT:
-            # Phase A: script execution not yet implemented
-            return "Error: script execution not enabled in this phase."
+            return self._handle_run_script(action, state)
 
         elif action.type == ActionType.FINAL_ANSWER:
             content = action.params.get("content", "")
@@ -247,6 +251,101 @@ class AgentCore:
 
         else:
             return f"Error: unknown action type '{action.type}'."
+
+    def _handle_run_script(self, action: Action, state: AgentState) -> str:
+        """
+        Handle RUN_SCRIPT action: permission check → path safety → approval → execute.
+
+        Returns an observation string in all cases (never raises).
+        Emits ACTION_FAILED on any error so the model can observe the failure.
+        """
+        if self._tools is None:
+            obs = "Error: script execution not enabled (ToolsRuntime not configured)."
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": ActionType.RUN_SCRIPT,
+                "reason": "tools_not_configured",
+            })
+            return obs
+
+        skill_name = action.params.get("skill_name", "")
+        script = action.params.get("script", "")
+        args = action.params.get("args", [])
+        env_overrides = action.params.get("env_overrides")
+
+        # Resolve the active skill metadata (must have been loaded first)
+        meta = next(
+            (m for m in state.active_skills if m.name == skill_name),
+            None,
+        )
+        if meta is None:
+            obs = (
+                f"ToolNotAllowed: skill '{skill_name}' is not loaded. "
+                "Use LOAD_SKILL first."
+            )
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": ActionType.RUN_SCRIPT,
+                "reason": "skill_not_loaded",
+                "skill": skill_name,
+            })
+            return obs
+
+        try:
+            result = self._tools.run_script(
+                skill_meta=meta,
+                script=script,
+                args=args,
+                env_overrides=env_overrides,
+            )
+        except ToolNotAllowedError as exc:
+            obs = f"ToolNotAllowed: {exc}"
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": ActionType.RUN_SCRIPT,
+                "reason": "permission_denied",
+                "skill": skill_name,
+                "script": script,
+            })
+            self._sink.on_error(obs, recoverable=True)
+            return obs
+        except ApprovalDeniedError as exc:
+            obs = f"ApprovalDenied: {exc}"
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": ActionType.RUN_SCRIPT,
+                "reason": "approval_denied",
+                "skill": skill_name,
+                "script": script,
+            })
+            self._sink.on_error(obs, recoverable=True)
+            return obs
+        except ToolsRuntimeError as exc:
+            obs = f"ScriptError: {exc}"
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": ActionType.RUN_SCRIPT,
+                "reason": "runtime_error",
+                "detail": str(exc),
+            })
+            self._sink.on_error(obs, recoverable=True)
+            return obs
+
+        self._sink.on_progress("run_script", script)
+
+        if result.timed_out:
+            obs = (
+                f"ScriptTimedOut: '{script}' exceeded time limit.\n"
+                f"stderr: {result.stderr}"
+            )
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": ActionType.RUN_SCRIPT,
+                "reason": "timed_out",
+                "script": script,
+            })
+            return obs
+
+        obs_parts = [f"returncode={result.returncode}"]
+        if result.stdout:
+            obs_parts.append(f"stdout:\n{result.stdout}")
+        if result.stderr:
+            obs_parts.append(f"stderr:\n{result.stderr}")
+        return "\n".join(obs_parts)
 
     def _check_dead_loop_hash(self, action: Action, state: AgentState) -> bool:
         """
