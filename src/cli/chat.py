@@ -5,6 +5,7 @@ import sys
 from agent.core import AgentCore
 from model.mock import MockModel
 from output.cli_sink import CLISink
+from session.compressor import ConversationCompressor
 from session.session import SessionManager
 from skills.loader import SkillLoader
 
@@ -36,6 +37,10 @@ def run_chat(args) -> None:
     event_logger = _build_event_logger(getattr(args, "log_dir", None))
 
     print("Type 'exit' or press Ctrl+C to quit.\n")
+
+    # Phase B: one compressor instance for the whole session; model reference
+    # is updated each turn so the compressor reuses the same adapter as AgentCore.
+    compressor = ConversationCompressor(model=MockModel(actions=[]))
 
     while True:
         try:
@@ -73,4 +78,8 @@ def run_chat(args) -> None:
         # Persist state
         ctx.record_turn(user_input, response)
         session_manager.append_log(ctx, user_input, response)
+
+        # Phase B: compress if recent_turns exceeded threshold, then save
+        compressor._model = core._model
+        compressor.maybe_compress(ctx)
         session_manager.save(ctx)

@@ -122,11 +122,11 @@ A0.1（项目结构）
 
 | 任务 | 名称 | 状态 | 备注 |
 |------|------|------|------|
-| B1.1 | Tools Runtime（脚本执行器） | ⬜ 待开始 | |
-| B2.1 | 权限强制执行 | ⬜ 待开始 | |
-| B3.1 | ContextBuilder（上下文组装与裁剪） | ⬜ 待开始 | |
-| B4.1 | AgentState 持久化与崩溃恢复 | ⬜ 待开始 | |
-| B5.1 | 会话上下文压缩（ConversationCompressor） | ⬜ 待开始 | |
+| B1.1 | Tools Runtime（脚本执行器） | ✅ 已完成 | |
+| B2.1 | 权限强制执行 | ✅ 已完成 | |
+| B3.1 | ContextBuilder（上下文组装与裁剪） | ✅ 已完成 | |
+| B4.1 | AgentState 持久化与崩溃恢复 | ✅ 已完成 | |
+| B5.1 | 会话上下文压缩（ConversationCompressor） | ✅ 已完成 | |
 
 ### Phase C：真实 LLM 适配器 + 流式 JSON 解析器
 

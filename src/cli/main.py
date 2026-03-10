@@ -30,6 +30,24 @@ def _build_event_logger(log_dir: str | None = None):
     return EventLogger(path=log_path, session_id=session_id)
 
 
+def _build_run_dir_and_logger(
+    run_base: str = ".agent/runs",
+    session_id: str | None = None,
+) -> tuple[Path, "EventLogger"]:
+    """
+    Create/return a run_dir and EventLogger that write into .agent/runs/<session-id>/.
+    Used by B4.1 persistence and --resume support.
+    """
+    from agent.events import EventLogger
+
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+    run_dir = Path(run_base) / session_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = str(run_dir / "events.jsonl")
+    return run_dir, EventLogger(path=log_path, session_id=session_id)
+
+
 def _add_skill_root(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--skill-root",
@@ -64,6 +82,18 @@ def main() -> None:
     _add_skill_root(run_parser)
     _add_log_dir(run_parser)
     run_parser.add_argument("query", help="User query / task description")
+    run_parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="SESSION-ID",
+        help="Resume a crashed run by session ID (reads from .agent/runs/<SESSION-ID>/)",
+    )
+    run_parser.add_argument(
+        "--run-base",
+        default=".agent/runs",
+        metavar="PATH",
+        help="Base directory for run state (default: .agent/runs)",
+    )
     run_parser.add_argument(
         "--verbose", action="store_true", help="Show observation details in stderr"
     )

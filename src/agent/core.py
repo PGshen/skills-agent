@@ -2,10 +2,13 @@
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Optional
 
+from agent.context import ContextBuilder, _plan_summary as _format_plan_summary
 from agent.events import EventLogger, EventType
 from agent.plan import Action, ActionType, Plan
+from agent.recovery import save_state
 from agent.state import AgentState
 from model.base import ModelAdapter
 from output.sink import NullSink, OutputSink
@@ -17,39 +20,6 @@ from tools.runtime import (
     ToolNotAllowedError,
     ToolsRuntimeError,
 )
-
-SYSTEM_PROMPT_TEMPLATE = """\
-你是一个 AI Agent，通过 ReAct 循环（推理 → 行动 → 观察）完成用户任务。
-
-## 可用技能索引
-{skill_index}
-
-## 当前计划
-{plan_summary}
-
-## 行动协议
-每次回复必须是一个 JSON 对象，格式：
-{{
-  "type": "<load_skill|load_resource|run_script|update_plan|final_answer>",
-  "params": {{ ... }}
-}}
-
-## 约束
-- 每次只能输出一个 action
-- load_resource / run_script 必须在 load_skill 之后
-- update_plan 中的 plan 为完整新 Plan（全量替换）
-- final_answer 时输出完整最终答案
-"""
-
-
-def _format_plan_summary(plan: Optional[Plan]) -> str:
-    """Format plan as human-readable summary for system prompt."""
-    if plan is None:
-        return "(no plan yet)"
-    lines = [f"Goal: {plan.goal}", "Steps:"]
-    for step in plan.steps:
-        lines.append(f"  [{step.status.value:<11}] {step.id}: {step.description}")
-    return "\n".join(lines)
 
 
 class AgentCore:
@@ -64,6 +34,8 @@ class AgentCore:
         max_turns: int = 20,
         dead_loop_window: int = 6,       # action hash detection window size
         dead_loop_stall_turns: int = 4,  # Phase B: plan stall warning threshold
+        max_context_tokens: int = 100_000,
+        run_dir: Optional[Path] = None,  # B4.1: persistence directory
     ):
         self._model = model
         self._registry = registry
@@ -74,27 +46,36 @@ class AgentCore:
         self._max_turns = max_turns
         self._dead_loop_window = dead_loop_window
         self._dead_loop_stall_turns = dead_loop_stall_turns
+        self._context_builder = ContextBuilder(max_context_tokens=max_context_tokens)
+        self._run_dir = run_dir
 
     def run(
         self,
         user_input: str,
         history_messages: list[dict] = None,
+        initial_state: Optional[AgentState] = None,
     ) -> str:
         """
         Execute full ReAct loop, return final answer string.
 
-        history_messages: built by SessionContext.build_history_messages() in chat mode.
-        Single-shot mode (run command): omit or pass None (treated as []).
+        history_messages: built by SessionContext.build_history_messages() in chat mode,
+            or by build_resume_context() for crash recovery (B4.1).
+        initial_state: restored AgentState for crash recovery; if None, a fresh state is created.
+        Single-shot mode (run command): omit both or pass None (treated as []).
         """
         if history_messages is None:
             history_messages = []
 
         # Initialization
         skill_metas = self._registry.scan()
-        state = AgentState(
-            session_id=self._logger.session_id,
-            user_input=user_input,
-        )
+        if initial_state is not None:
+            state = initial_state
+            state.user_input = user_input
+        else:
+            state = AgentState(
+                session_id=self._logger.session_id,
+                user_input=user_input,
+            )
         self._logger.emit(EventType.SESSION_START, {
             "user_input": user_input,
             "skill_count": len(skill_metas),
@@ -169,39 +150,12 @@ class AgentCore:
         react_history: list[tuple[Action, str]],
     ) -> list[dict]:
         """Assemble the messages list for the current turn."""
-        skill_index = self._registry.to_index_text()
-        plan_summary = _format_plan_summary(state.plan)
-
-        system_content = SYSTEM_PROMPT_TEMPLATE.format(
-            skill_index=skill_index,
-            plan_summary=plan_summary,
+        return self._context_builder.build(
+            state=state,
+            registry=self._registry,
+            react_history=react_history,
+            history_messages=history_messages,
         )
-
-        messages: list[dict] = [
-            {"role": "system", "content": system_content},
-        ]
-
-        # History layer (chat mode): pre-compressed summary + recent raw turns
-        messages.extend(history_messages)
-
-        # In-task ReAct history: alternating action / observation
-        for prev_action, observation in react_history:
-            messages.append({
-                "role": "assistant",
-                "content": json.dumps(
-                    {"type": prev_action.type, "params": prev_action.params},
-                    ensure_ascii=False,
-                ),
-            })
-            messages.append({
-                "role": "user",
-                "content": f"Observation: {observation}",
-            })
-
-        # Current user input
-        messages.append({"role": "user", "content": state.user_input})
-
-        return messages
 
     def _execute_action(self, action: Action, state: AgentState) -> str:
         """Execute a single Action, return observation string for next context."""
@@ -211,6 +165,8 @@ class AgentCore:
             state.plan = state.plan.replace(new_plan) if state.plan else new_plan
             self._sink.on_plan_updated(state.plan)
             self._logger.emit(EventType.PLAN_UPDATED, state.plan.model_dump())
+            if self._run_dir is not None:
+                save_state(self._run_dir, state)
             return "Plan updated."
 
         elif action.type == ActionType.LOAD_SKILL:
