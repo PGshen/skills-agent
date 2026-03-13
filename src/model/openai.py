@@ -1,5 +1,10 @@
 """OpenAIAdapter: OpenAI API integration (Phase C)."""
+import json
+import logging
+
 from openai import OpenAI
+
+logger = logging.getLogger(__name__)
 
 from agent.plan import Action
 from output.sink import NullSink, OutputSink
@@ -107,6 +112,11 @@ class OpenAIAdapter(ModelAdapter):
 
     def next_action(self, messages: list[dict]) -> Action:
         """Non-streaming call. AgentCore._execute_action() emits the text chunk."""
+        logger.debug(
+            "request model=%s messages=%s",
+            self._model,
+            json.dumps(messages, ensure_ascii=False),
+        )
         response = self._client.chat.completions.create(
             model=self._model,
             max_tokens=self._max_tokens,
@@ -114,6 +124,7 @@ class OpenAIAdapter(ModelAdapter):
             response_format=_ACTION_RESPONSE_FORMAT,
         )
         raw = response.choices[0].message.content
+        logger.debug("response model=%s raw=%s", self._model, raw)
         return parse_action_response(raw)
 
     def next_action_streaming(self, messages: list[dict]) -> Action:
@@ -132,6 +143,11 @@ class OpenAIAdapter(ModelAdapter):
             "$.params.content": on_answer_chunk,
         })
 
+        logger.debug(
+            "request(stream) model=%s messages=%s",
+            self._model,
+            json.dumps(messages, ensure_ascii=False),
+        )
         stream = self._client.chat.completions.create(
             model=self._model,
             max_tokens=self._max_tokens,
@@ -146,4 +162,6 @@ class OpenAIAdapter(ModelAdapter):
                 parser.feed(delta)
                 raw_chunks.append(delta)
 
-        return parse_action_response("".join(raw_chunks))
+        raw = "".join(raw_chunks)
+        logger.debug("response(stream) model=%s raw=%s", self._model, raw)
+        return parse_action_response(raw)

@@ -19,6 +19,8 @@ class EventType(str, Enum):
     FINAL_ANSWER = "final_answer"
     DEAD_LOOP_DETECTED = "dead_loop_detected"
     ERROR = "error"
+    MODEL_REQUEST = "model_request"
+    MODEL_RESPONSE = "model_response"
 
 
 class Event(BaseModel):

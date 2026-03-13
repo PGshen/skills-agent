@@ -1,0 +1,29 @@
+{
+  "model": {
+    "backend": "openai",
+    "openai_model": "gpt-4o",
+    "max_tokens": 12800
+  },
+  "agent": {
+    "max_turns": 20,
+    "dead_loop_window": 6,
+    "dead_loop_stall_turns": 4,
+    "max_context_tokens": 100000
+  },
+  "paths": {
+    "skill_root": "./skills",
+    "run_base": ".agent/runs",
+    "session_dir": ".agent/sessions",
+    "log_dir": null
+  },
+  "compressor": {
+    "threshold_ratio": 0.25,
+    "compress_oldest_m": 2
+  },
+  "cli": {
+    "verbose": false,
+    "color": true,
+    "log_level": "DEBUG",
+    "log_file": ".agent/debug.log"
+  }
+}

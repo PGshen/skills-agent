@@ -6,35 +6,44 @@ import tempfile
 import uuid
 from pathlib import Path
 
-def _add_skill_root(parser: argparse.ArgumentParser) -> None:
+from common.config import Config, get_config
+from common.logging import setup_logging
+
+
+def _add_skill_root(parser: argparse.ArgumentParser, cfg: Config) -> None:
     parser.add_argument(
         "--skill-root",
-        default="./skills",
+        default=cfg.paths.skill_root,
         metavar="PATH",
-        help="Directory to scan for skills (default: ./skills)",
+        help=f"Directory to scan for skills (default: {cfg.paths.skill_root!r})",
     )
 
 
-def _add_model(parser: argparse.ArgumentParser) -> None:
+def _add_model(parser: argparse.ArgumentParser, cfg: Config) -> None:
     parser.add_argument(
         "--model",
-        default="openai",
+        default=cfg.model.backend,
         choices=["openai", "mock"],
         metavar="MODEL",
-        help="Model backend: 'openai' (default) or 'mock' (testing)",
+        help=f"Model backend: 'openai' or 'mock' (default: {cfg.model.backend!r})",
     )
 
 
 def _build_model(args, sink=None):
     """Instantiate the model adapter selected by --model."""
-    model_id = getattr(args, "model", "openai")
+    cfg = get_config()
+    model_id = getattr(args, "model", cfg.model.backend)
     if model_id == "mock":
         from model.mock import MockModel
         return MockModel(actions=[
             {"type": "final_answer", "params": {"content": "[MockModel] ready"}}
         ])
     from model.openai import OpenAIAdapter
-    return OpenAIAdapter(sink=sink)
+    return OpenAIAdapter(
+        model=cfg.model.openai_model,
+        max_tokens=cfg.model.max_tokens,
+        sink=sink,
+    )
 
 
 def _build_registry(skill_root: str):
@@ -71,16 +80,18 @@ def _build_event_logger(log_dir: str | None = None):
     return EventLogger(path=log_path, session_id=session_id)
 
 
-def _add_log_dir(parser: argparse.ArgumentParser) -> None:
+def _add_log_dir(parser: argparse.ArgumentParser, cfg: Config) -> None:
     parser.add_argument(
         "--log-dir",
-        default=None,
+        default=cfg.paths.log_dir,
         metavar="PATH",
         help="Directory for event log files (default: system temp dir)",
     )
 
 
 def main() -> None:
+    cfg = get_config()
+
     parser = argparse.ArgumentParser(
         prog="skills-agent",
         description="Agent Skills System — ReAct loop with skill discovery",
@@ -93,9 +104,9 @@ def main() -> None:
         help="Run the agent on a single query",
         description="Run the ReAct agent on a query using MockModel (Phase A).",
     )
-    _add_skill_root(run_parser)
-    _add_log_dir(run_parser)
-    _add_model(run_parser)
+    _add_skill_root(run_parser, cfg)
+    _add_log_dir(run_parser, cfg)
+    _add_model(run_parser, cfg)
     run_parser.add_argument("query", help="User query / task description")
     run_parser.add_argument(
         "--resume",
@@ -105,15 +116,21 @@ def main() -> None:
     )
     run_parser.add_argument(
         "--run-base",
-        default=".agent/runs",
+        default=cfg.paths.run_base,
         metavar="PATH",
-        help="Base directory for run state (default: .agent/runs)",
+        help=f"Base directory for run state (default: {cfg.paths.run_base!r})",
     )
     run_parser.add_argument(
-        "--verbose", action="store_true", help="Show observation details in stderr"
+        "--verbose",
+        action="store_true",
+        default=cfg.cli.verbose,
+        help="Show observation details in stderr",
     )
     run_parser.add_argument(
-        "--no-color", action="store_true", help="Disable ANSI color output"
+        "--no-color",
+        action="store_true",
+        default=not cfg.cli.color,
+        help="Disable ANSI color output",
     )
 
     # --- chat ---
@@ -122,14 +139,14 @@ def main() -> None:
         help="Start interactive multi-turn chat session",
         description="Run the agent in interactive chat mode with session persistence.",
     )
-    _add_skill_root(chat_parser)
-    _add_log_dir(chat_parser)
-    _add_model(chat_parser)
+    _add_skill_root(chat_parser, cfg)
+    _add_log_dir(chat_parser, cfg)
+    _add_model(chat_parser, cfg)
     chat_parser.add_argument(
         "--session-dir",
-        default=".agent/sessions",
+        default=cfg.paths.session_dir,
         metavar="PATH",
-        help="Directory to store session files (default: .agent/sessions)",
+        help=f"Directory to store session files (default: {cfg.paths.session_dir!r})",
     )
     chat_parser.add_argument(
         "--resume",
@@ -138,10 +155,16 @@ def main() -> None:
         help="Resume an existing session by ID",
     )
     chat_parser.add_argument(
-        "--verbose", action="store_true", help="Show observation details in stderr"
+        "--verbose",
+        action="store_true",
+        default=cfg.cli.verbose,
+        help="Show observation details in stderr",
     )
     chat_parser.add_argument(
-        "--no-color", action="store_true", help="Disable ANSI color output"
+        "--no-color",
+        action="store_true",
+        default=not cfg.cli.color,
+        help="Disable ANSI color output",
     )
 
     # --- skills ---
@@ -158,7 +181,7 @@ def main() -> None:
         help="List all available skills",
         description="Print a table of discovered skills.",
     )
-    _add_skill_root(list_parser)
+    _add_skill_root(list_parser, cfg)
 
     # skills inspect
     inspect_parser = skills_sub.add_parser(
@@ -166,10 +189,11 @@ def main() -> None:
         help="Show full details of a skill",
         description="Print all frontmatter fields for a named skill.",
     )
-    _add_skill_root(inspect_parser)
+    _add_skill_root(inspect_parser, cfg)
     inspect_parser.add_argument("skill_name", metavar="SKILL-NAME", help="Name of the skill")
 
     args = parser.parse_args()
+    setup_logging(level=cfg.cli.log_level, log_file=cfg.cli.log_file)
 
     if args.command == "run":
         from cli.run import cmd_run

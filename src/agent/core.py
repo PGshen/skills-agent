@@ -89,6 +89,11 @@ class AgentCore:
             state.turn_count += 1
 
             messages = self._build_context(state, history_messages, react_history)
+            self._logger.emit(EventType.MODEL_REQUEST, {
+                "turn": state.turn_count,
+                "message_count": len(messages),
+                "messages": messages,
+            })
             self._sink.on_thinking_start(state.turn_count)
             try:
                 if hasattr(self._model, "next_action_streaming"):
@@ -106,6 +111,10 @@ class AgentCore:
                 })
                 break
 
+            self._logger.emit(EventType.MODEL_RESPONSE, {
+                "turn": state.turn_count,
+                "action_type": str(action.type),
+            })
             self._logger.emit(EventType.ACTION_REQUESTED, {
                 "turn": state.turn_count,
                 "action_type": action.type,

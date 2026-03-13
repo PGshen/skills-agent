@@ -3,6 +3,7 @@
 import sys
 
 from agent.core import AgentCore
+from common.config import get_config
 from output.cli_sink import CLISink
 from session.compressor import ConversationCompressor
 from session.session import SessionManager
@@ -12,6 +13,8 @@ from skills.loader import SkillLoader
 def run_chat(args) -> None:
     """Interactive chat mode main loop."""
     from cli.main import _build_event_logger, _build_model, _build_registry
+
+    cfg = get_config()
 
     session_manager = SessionManager(sessions_root=args.session_dir)
 
@@ -28,7 +31,7 @@ def run_chat(args) -> None:
             return
         print(f"{_dim}Resumed session {ctx.session_id} · turn {ctx.total_turn_count}{_reset}")
     else:
-        ctx = session_manager.create(model_id="mock")
+        ctx = session_manager.create(model_id=getattr(args, "model", cfg.model.backend))
         print(f"{_dim}Session {ctx.session_id}{_reset}")
 
     sink = CLISink(
@@ -45,7 +48,12 @@ def run_chat(args) -> None:
     model = _build_model(args, sink=sink)
 
     # One compressor instance for the whole session; reuses the same model adapter.
-    compressor = ConversationCompressor(model=model)
+    compressor = ConversationCompressor(
+        model=model,
+        context_limit_tokens=cfg.agent.max_context_tokens,
+        threshold_ratio=cfg.compressor.threshold_ratio,
+        compress_oldest_m=cfg.compressor.compress_oldest_m,
+    )
 
     while True:
         try:
@@ -65,6 +73,10 @@ def run_chat(args) -> None:
             loader=loader,
             event_logger=event_logger,
             sink=sink,
+            max_turns=cfg.agent.max_turns,
+            dead_loop_window=cfg.agent.dead_loop_window,
+            dead_loop_stall_turns=cfg.agent.dead_loop_stall_turns,
+            max_context_tokens=cfg.agent.max_context_tokens,
         )
 
         # Assemble history layer from session context

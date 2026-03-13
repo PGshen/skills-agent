@@ -1,6 +1,7 @@
 """skills-agent run: single-query agent execution."""
 
 from agent.core import AgentCore
+from common.config import get_config
 from output.cli_sink import CLISink
 from skills.loader import SkillLoader
 
@@ -9,17 +10,17 @@ def cmd_run(args) -> int:
     """Execute `skills-agent run`."""
     from cli.main import _build_model, _build_registry, _build_run_dir_and_logger
 
+    cfg = get_config()
     registry = _build_registry(args.skill_root)
     loader = SkillLoader()
     sink = CLISink(verbose=args.verbose, color=not args.no_color)
 
     resume_session_id = getattr(args, "resume", None)
-    run_base = getattr(args, "run_base", ".agent/runs")
+    run_base = getattr(args, "run_base", cfg.paths.run_base)
 
     if resume_session_id:
         # --- Resume path ---
-        from pathlib import Path
-        from agent.recovery import load_state, build_resume_context
+        from agent.recovery import build_resume_context, load_state
 
         run_dir, event_logger = _build_run_dir_and_logger(
             run_base=run_base,
@@ -46,6 +47,10 @@ def cmd_run(args) -> int:
         event_logger=event_logger,
         sink=sink,
         run_dir=run_dir,
+        max_turns=cfg.agent.max_turns,
+        dead_loop_window=cfg.agent.dead_loop_window,
+        dead_loop_stall_turns=cfg.agent.dead_loop_stall_turns,
+        max_context_tokens=cfg.agent.max_context_tokens,
     )
 
     core.run(args.query, history_messages=resume_messages, initial_state=initial_state)
