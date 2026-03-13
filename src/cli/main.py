@@ -6,38 +6,51 @@ import tempfile
 import uuid
 from pathlib import Path
 
+def _add_skill_root(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--skill-root",
+        default="./skills",
+        metavar="PATH",
+        help="Directory to scan for skills (default: ./skills)",
+    )
+
+
+def _add_model(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--model",
+        default="openai",
+        choices=["openai", "mock"],
+        metavar="MODEL",
+        help="Model backend: 'openai' (default) or 'mock' (testing)",
+    )
+
+
+def _build_model(args, sink=None):
+    """Instantiate the model adapter selected by --model."""
+    model_id = getattr(args, "model", "openai")
+    if model_id == "mock":
+        from model.mock import MockModel
+        return MockModel(actions=[
+            {"type": "final_answer", "params": {"content": "[MockModel] ready"}}
+        ])
+    from model.openai import OpenAIAdapter
+    return OpenAIAdapter(sink=sink)
+
 
 def _build_registry(skill_root: str):
     from skills.registry import SkillRegistry
 
     roots = [{"source": "project", "path": skill_root, "priority": 0}]
-
-    # Include built-in skills directory if it exists next to the project root
     builtin_dir = Path(__file__).parent.parent.parent / "skills_builtin"
     if builtin_dir.is_dir():
         roots.append({"source": "builtin", "path": str(builtin_dir), "priority": 100})
-
     return SkillRegistry(roots)
-
-
-def _build_event_logger(log_dir: str | None = None):
-    from agent.events import EventLogger
-
-    session_id = str(uuid.uuid4())
-    if log_dir is None:
-        log_dir = tempfile.mkdtemp()
-    log_path = str(Path(log_dir) / f"{session_id}.jsonl")
-    return EventLogger(path=log_path, session_id=session_id)
 
 
 def _build_run_dir_and_logger(
     run_base: str = ".agent/runs",
     session_id: str | None = None,
-) -> tuple[Path, "EventLogger"]:
-    """
-    Create/return a run_dir and EventLogger that write into .agent/runs/<session-id>/.
-    Used by B4.1 persistence and --resume support.
-    """
+):
     from agent.events import EventLogger
 
     if session_id is None:
@@ -48,13 +61,14 @@ def _build_run_dir_and_logger(
     return run_dir, EventLogger(path=log_path, session_id=session_id)
 
 
-def _add_skill_root(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--skill-root",
-        default="./skills",
-        metavar="PATH",
-        help="Directory to scan for skills (default: ./skills)",
-    )
+def _build_event_logger(log_dir: str | None = None):
+    from agent.events import EventLogger
+
+    session_id = str(uuid.uuid4())
+    if log_dir is None:
+        log_dir = tempfile.mkdtemp()
+    log_path = str(Path(log_dir) / f"{session_id}.jsonl")
+    return EventLogger(path=log_path, session_id=session_id)
 
 
 def _add_log_dir(parser: argparse.ArgumentParser) -> None:
@@ -81,6 +95,7 @@ def main() -> None:
     )
     _add_skill_root(run_parser)
     _add_log_dir(run_parser)
+    _add_model(run_parser)
     run_parser.add_argument("query", help="User query / task description")
     run_parser.add_argument(
         "--resume",
@@ -109,6 +124,7 @@ def main() -> None:
     )
     _add_skill_root(chat_parser)
     _add_log_dir(chat_parser)
+    _add_model(chat_parser)
     chat_parser.add_argument(
         "--session-dir",
         default=".agent/sessions",

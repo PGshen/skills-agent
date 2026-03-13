@@ -31,7 +31,7 @@ This is an **Agent Skills system** — a Python-native framework that lets a ReA
 |-------|--------|-------------|
 | **A** | In progress | Core data structures + MockModel-driven ReAct loop |
 | **B** | Not started | Script execution, permissions, context trimming |
-| **C** | Not started | Real Anthropic API adapter + streaming JSON parser |
+| **C** | Not started | Real OpenAI API adapter + streaming JSON parser |
 
 Current progress is tracked in [docs/dev/dev_plan.md](docs/dev/dev_plan.md). Detailed task specs are in [docs/dev/phase_a.md](docs/dev/phase_a.md), [phase_b.md](docs/dev/phase_b.md), [phase_c.md](docs/dev/phase_c.md).
 
@@ -53,7 +53,7 @@ resource-limits:
 
 **ReAct Loop** (`AgentCore`) — each turn the model returns an `Action` (one of `LOAD_SKILL`, `LOAD_RESOURCE`, `RUN_SCRIPT`, `UPDATE_PLAN`, `FINAL_ANSWER`). The core executes it and loops until `FINAL_ANSWER` or termination.
 
-**ModelAdapter** — the only interface between AgentCore and a model. `next_action(messages) -> Action`. Phase A/B use `MockModel`; Phase C swaps in `AnthropicAdapter` without changing the core.
+**ModelAdapter** — the only interface between AgentCore and a model. `next_action(messages) -> Action`. Phase A/B use `MockModel`; Phase C swaps in `OpenAIAdapter` without changing the core.
 
 **OutputSink** — decouples AgentCore from output. `NullSink` (= base class) for tests, `CLISink` for terminal (progress → stderr, answer → stdout), `SSESink` for HTTP streaming.
 
@@ -77,7 +77,7 @@ src/
   model/
     base.py          # ModelAdapter ABC + parse_action_response + RetryAdapter
     mock.py          # MockModel(actions=[...]) for testing
-    anthropic.py     # AnthropicAdapter (Phase C)
+    openai.py        # OpenAIAdapter (Phase C)
     streaming.py     # StreamingJSONParser FSM (Phase C)
   output/
     sink.py          # OutputSink base class; NullSink = OutputSink
@@ -113,7 +113,7 @@ src/
 
 5. **Path traversal guard.** `load_resource()` must reject paths containing `..` or starting with `/`, then verify the resolved path stays within the skill directory via `str(resolved).startswith(str(skill_dir.resolve()))`.
 
-6. **`ModelAdapter.next_action(messages) -> Action` interface is frozen.** Swapping MockModel → AnthropicAdapter in Phase C must require zero changes to AgentCore.
+6. **`ModelAdapter.next_action(messages) -> Action` interface is frozen.** Swapping MockModel → OpenAIAdapter in Phase C must require zero changes to AgentCore.
 
 ### Test Layout
 

@@ -1,14 +1,13 @@
 """skills-agent run: single-query agent execution."""
 
 from agent.core import AgentCore
-from model.mock import MockModel
 from output.cli_sink import CLISink
 from skills.loader import SkillLoader
 
 
 def cmd_run(args) -> int:
     """Execute `skills-agent run`."""
-    from cli.main import _build_registry, _build_run_dir_and_logger
+    from cli.main import _build_model, _build_registry, _build_run_dir_and_logger
 
     registry = _build_registry(args.skill_root)
     loader = SkillLoader()
@@ -38,14 +37,7 @@ def cmd_run(args) -> int:
         initial_state = None
         resume_messages = []
 
-    # Phase A: use MockModel that immediately returns FINAL_ANSWER
-    mock_actions = [
-        {
-            "type": "final_answer",
-            "params": {"content": f"[MockModel] Received: {args.query}"},
-        }
-    ]
-    model = MockModel(actions=mock_actions)
+    model = _build_model(args, sink=sink)
 
     core = AgentCore(
         model=model,

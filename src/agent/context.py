@@ -6,26 +6,35 @@ from agent.plan import Action, Plan
 from agent.state import AgentState
 from skills.registry import SkillRegistry
 
-SYSTEM_PROMPT_TEMPLATE = """你是一个 AI Agent，通过 ReAct 循环（推理 → 行动 → 观察）完成用户任务。
+SYSTEM_PROMPT_TEMPLATE = """You are an AI Agent that completes user tasks via a ReAct loop (Reason → Act → Observe).
 
-## 可用技能索引
+CRITICAL: Every reply MUST be a single valid JSON object. No prose, no markdown, no explanation outside the JSON.
+
+## Available Skills
 {skill_index}
 
-## 当前计划
+## Current Plan
 {plan_summary}
 
-## 行动协议
-每次回复必须是一个 JSON 对象，格式：
+## Action Protocol
+Output exactly one JSON object per turn:
 {{
-  "type": "<load_skill|load_resource|run_script|update_plan|final_answer>",
+  "type": "<action_type>",
   "params": {{ ... }}
 }}
 
-## 约束
-- 每次只能输出一个 action
-- load_resource / run_script 必须在 load_skill 之后
-- update_plan 中的 plan 为完整新 Plan（全量替换）
-- final_answer 时输出完整最终答案
+Action types and their params:
+- "load_skill":    {{"skill_name": "<name>"}}
+- "load_resource": {{"skill_name": "<name>", "resource": "<filename>"}}
+- "run_script":    {{"skill_name": "<name>", "script": "<path>", "args": []}}
+- "update_plan":   {{"plan": {{"goal": "...", "steps": [...]}}}}
+- "final_answer":  {{"content": "<complete answer text>"}}
+
+## Rules
+- Output ONLY the JSON object — no text before or after it
+- load_resource / run_script require the skill to be loaded first via load_skill
+- update_plan replaces the entire plan (full replacement, not patch)
+- Use final_answer when you can answer directly; params.content must contain the full response
 """
 
 _MIN_REACT_TURNS = 3

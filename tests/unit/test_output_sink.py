@@ -62,14 +62,15 @@ class TestCLISink:
         sink = CLISink(color=False)
         sink.on_progress("load_skill", "data-analysis")
         captured = capsys.readouterr()
-        assert "load_skill: data-analysis" in captured.err
+        assert "Load Skill" in captured.err
+        assert "data-analysis" in captured.err
         assert captured.out == ""
 
     def test_progress_without_detail(self, capsys):
         sink = CLISink(color=False)
         sink.on_progress("run_script")
         captured = capsys.readouterr()
-        assert "run_script" in captured.err
+        assert "Run Script" in captured.err
         assert captured.out == ""
 
     def test_text_chunk_goes_to_stdout(self, capsys):
@@ -106,11 +107,12 @@ class TestCLISink:
         captured = capsys.readouterr()
         assert "chunk1chunk2chunk3" in captured.out
 
-    def test_observation_hidden_by_default(self, capsys):
+    def test_observation_always_shown(self, capsys):
+        # observations are shown in both verbose and non-verbose modes
         sink = CLISink(verbose=False, color=False)
         sink.on_observation("script", "some output")
         captured = capsys.readouterr()
-        assert "some output" not in captured.err
+        assert "some output" in captured.err
         assert captured.out == ""
 
     def test_observation_visible_when_verbose(self, capsys):
@@ -120,21 +122,32 @@ class TestCLISink:
         assert "some output" in captured.err
         assert captured.out == ""
 
-    def test_observation_truncates_long_content(self, capsys):
-        sink = CLISink(verbose=True, color=False)
-        long_content = "x" * 500
-        sink.on_observation("script", long_content)
+    def test_observation_truncates_excess_lines(self, capsys):
+        # non-verbose default is max_obs_lines=8; pass 20 lines to trigger truncation
+        lines = [f"line{i}" for i in range(20)]
+        sink = CLISink(verbose=False, color=False, max_obs_lines=8)
+        sink.on_observation("script", "\n".join(lines))
         captured = capsys.readouterr()
-        assert "..." in captured.err
-        # Should be truncated, not the full 500 chars raw
-        assert len(captured.err) < 500
+        assert "more lines" in captured.err
+        # only first 8 lines shown, not all 20
+        assert "line19" not in captured.err
+
+    def test_observation_verbose_shows_more_lines(self, capsys):
+        # verbose shows 3× the limit
+        lines = [f"line{i}" for i in range(30)]
+        sink = CLISink(verbose=True, color=False, max_obs_lines=8)
+        sink.on_observation("script", "\n".join(lines))
+        captured = capsys.readouterr()
+        # first 24 lines visible (8*3=24), line24 should NOT appear
+        assert "line23" in captured.err
+        assert "line24" not in captured.err
 
     def test_error_recoverable_goes_to_stderr(self, capsys):
         sink = CLISink(color=False)
         sink.on_error("something failed", recoverable=True)
         captured = capsys.readouterr()
         assert "something failed" in captured.err
-        assert "[WARN]" in captured.err
+        assert "⚠" in captured.err
         assert captured.out == ""
 
     def test_error_fatal_goes_to_stderr(self, capsys):
@@ -142,7 +155,7 @@ class TestCLISink:
         sink.on_error("fatal crash", recoverable=False)
         captured = capsys.readouterr()
         assert "fatal crash" in captured.err
-        assert "[ERROR]" in captured.err
+        assert "✗" in captured.err
         assert captured.out == ""
 
     def test_session_end_to_stderr(self, capsys):

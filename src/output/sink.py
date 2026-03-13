@@ -51,6 +51,13 @@ class OutputSink:
         recoverable: True 表示 Agent 将继续尝试（如重试），False 表示致命错误
         """
 
+    def on_thinking_start(self, turn: int) -> None:
+        """
+        模型开始推理（调用 model.next_action 之前）。
+        turn: 当前轮次编号（从 1 开始）
+        用于显示 loading 状态（如 spinner）。
+        """
+
     def on_session_end(self, turn_count: int, status: str) -> None:
         """
         会话/任务结束通知。

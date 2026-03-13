@@ -3,7 +3,6 @@
 import sys
 
 from agent.core import AgentCore
-from model.mock import MockModel
 from output.cli_sink import CLISink
 from session.compressor import ConversationCompressor
 from session.session import SessionManager
@@ -12,41 +11,47 @@ from skills.loader import SkillLoader
 
 def run_chat(args) -> None:
     """Interactive chat mode main loop."""
-    from cli.main import _build_event_logger, _build_registry
+    from cli.main import _build_event_logger, _build_model, _build_registry
 
     session_manager = SessionManager(sessions_root=args.session_dir)
 
     # Support --resume <session-id> to restore an existing session
+    use_color = not getattr(args, "no_color", False)
+    _cyan  = "\033[36m" if use_color else ""
+    _dim   = "\033[2m"  if use_color else ""
+    _reset = "\033[0m"  if use_color else ""
+
     if getattr(args, "resume", None):
         ctx = session_manager.load(args.resume)
         if ctx is None:
             print(f"Session '{args.resume}' not found.", file=sys.stderr)
             return
-        print(f"Resuming session {ctx.session_id} (turn {ctx.total_turn_count})")
+        print(f"{_dim}Resumed session {ctx.session_id} · turn {ctx.total_turn_count}{_reset}")
     else:
         ctx = session_manager.create(model_id="mock")
-        print(f"Chat session started. Session: {ctx.session_id}")
+        print(f"{_dim}Session {ctx.session_id}{_reset}")
 
     sink = CLISink(
         verbose=getattr(args, "verbose", False),
-        color=not getattr(args, "no_color", False),
+        color=use_color,
     )
 
     registry = _build_registry(args.skill_root)
     loader = SkillLoader()
     event_logger = _build_event_logger(getattr(args, "log_dir", None))
 
-    print("Type 'exit' or press Ctrl+C to quit.\n")
+    print(f"{_dim}Type 'exit' or Ctrl+C to quit.{_reset}\n")
 
-    # Phase B: one compressor instance for the whole session; model reference
-    # is updated each turn so the compressor reuses the same adapter as AgentCore.
-    compressor = ConversationCompressor(model=MockModel(actions=[]))
+    model = _build_model(args, sink=sink)
+
+    # One compressor instance for the whole session; reuses the same model adapter.
+    compressor = ConversationCompressor(model=model)
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = input(f"{_cyan}>{_reset} ").strip()
         except (KeyboardInterrupt, EOFError):
-            print("\nGoodbye.")
+            print(f"\n{_dim}Goodbye.{_reset}")
             break
 
         if user_input.lower() in ("exit", "quit", "q"):
@@ -54,13 +59,6 @@ def run_chat(args) -> None:
         if not user_input:
             continue
 
-        # Phase A: MockModel with per-turn FINAL_ANSWER echoing the user input
-        model = MockModel(actions=[
-            {
-                "type": "final_answer",
-                "params": {"content": f"[MockModel] Received: {user_input}"},
-            }
-        ])
         core = AgentCore(
             model=model,
             registry=registry,
@@ -73,13 +71,16 @@ def run_chat(args) -> None:
         history_messages = ctx.build_history_messages()
 
         # Run agent
-        response = core.run(user_input, history_messages=history_messages)
+        try:
+            response = core.run(user_input, history_messages=history_messages)
+        except Exception as exc:  # noqa: BLE001
+            sink.on_error(str(exc), recoverable=False)
+            continue
 
         # Persist state
         ctx.record_turn(user_input, response)
         session_manager.append_log(ctx, user_input, response)
 
         # Phase B: compress if recent_turns exceeded threshold, then save
-        compressor._model = core._model
         compressor.maybe_compress(ctx)
         session_manager.save(ctx)

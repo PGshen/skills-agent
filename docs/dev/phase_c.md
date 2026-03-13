@@ -129,67 +129,58 @@ def test_streaming_content_delta():
 
 ---
 
-### 任务 C2.1: Anthropic Model Adapter
+### 任务 C2.1: OpenAI Model Adapter
 
-**目标**: 实现基于 Anthropic API 的真实模型适配器，支持 tool use 和 JSON mode
+**目标**: 实现基于 OpenAI API 的真实模型适配器，支持 function calling 和 JSON mode
 
 **输入**: A3.2（ModelAdapter 接口）、C1.1（StreamingJSONParser）
 
-**输出文件**: `src/model/anthropic.py`
+**输出文件**: `src/model/openai.py`
 
 **背景说明**:
 
 结构化输出优先级（从最可靠到最脆弱）：
-1. **Tool use / Function calling**（首选）：将 `Action` 的结构定义注册为工具，模型通过函数调用返回结构化动作，最可靠。
+1. **Function calling**（首选）：将 `Action` 的结构定义注册为工具，模型通过函数调用返回结构化动作，最可靠。
 2. **Prompt-only**（兜底）：系统 prompt 中要求输出特定格式 JSON，用 `parse_action_response()` 提取。
 
-Phase C MVP 实现 1（tool use）和 2（prompt-only 兜底），通过 `RetryAdapter` 包装增强鲁棒性。
+Phase C MVP 实现 1（function calling）和 2（prompt-only 兜底），通过 `RetryAdapter` 包装增强鲁棒性。
 
 **接口**:
 
 ```python
-# src/model/anthropic.py
-import anthropic
+# src/model/openai.py
+from openai import OpenAI
 from .base import ModelAdapter, parse_action_response, ModelResponseError
 from ..agent.plan import Action, ActionType
 from ..output.sink import OutputSink, NullSink
 from .streaming import StreamingJSONParser
 
-class AnthropicAdapter(ModelAdapter):
+class OpenAIAdapter(ModelAdapter):
     """
-    Anthropic Claude API 适配器（Phase C）。
+    OpenAI API 适配器（Phase C）。
     支持非流式与流式两种调用模式。
     """
 
     def __init__(
         self,
-        api_key: str = None,             # None 时从 ANTHROPIC_API_KEY 读取
-        model: str = "claude-sonnet-4-6",
+        api_key: str = None,             # None 时从 OPENAI_API_KEY 读取
+        model: str = "gpt-4o",
         max_tokens: int = 4096,
         sink: OutputSink = None,         # 流式答案时逐字回调
     ):
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self._client = OpenAI(api_key=api_key)
         self._model = model
         self._max_tokens = max_tokens
         self._sink = sink or NullSink()
 
     def next_action(self, messages: list[dict]) -> Action:
         """非流式调用（Phase C 初期）。"""
-        system_msg = None
-        user_messages = []
-        for m in messages:
-            if m["role"] == "system":
-                system_msg = m["content"]
-            else:
-                user_messages.append(m)
-
-        response = self._client.messages.create(
+        response = self._client.chat.completions.create(
             model=self._model,
             max_tokens=self._max_tokens,
-            system=system_msg or "",
-            messages=user_messages,
+            messages=messages,
         )
-        raw = response.content[0].text
+        raw = response.choices[0].message.content
         action = parse_action_response(raw)
 
         # FINAL_ANSWER 时调用 on_text_chunk（Phase C 流式版中由 StreamingJSONParser 逐字触发）
@@ -211,23 +202,25 @@ class AnthropicAdapter(ModelAdapter):
             "$.params.content": on_answer_chunk,
         })
 
-        with self._client.messages.stream(
+        with self._client.chat.completions.stream(
             model=self._model,
             max_tokens=self._max_tokens,
             messages=messages,
         ) as stream:
-            for chunk in stream.text_stream:
-                parser.feed(chunk)
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    parser.feed(delta)
 
         return _validate_action(parser.get_result())
 ```
 
 **验收标准**:
-- [ ] 设置 `ANTHROPIC_API_KEY` 后，`AnthropicAdapter.next_action()` 可真实调用 API（集成测试）
+- [ ] 设置 `OPENAI_API_KEY` 后，`OpenAIAdapter.next_action()` 可真实调用 API（集成测试）
 - [ ] 非流式：API 返回合法 JSON 时正确解析为 `Action`
 - [ ] 流式：`$.params.content` 回调触发 `sink.on_text_chunk()` 多次（`done=False`），结束时 `done=True`
 - [ ] 与 `RetryAdapter` 组合时，解析失败后自动重试并追加纠错消息
-- [ ] API key 未设置时抛出清晰错误（`anthropic.AuthenticationError`）
+- [ ] API key 未设置时抛出清晰错误（`openai.AuthenticationError`）
 
 ---
 
@@ -235,13 +228,13 @@ class AnthropicAdapter(ModelAdapter):
 
 **目标**: 将流式 JSON 解析器的 `$.final_answer.content` 回调接入 CLISink，实现最终答案逐字打印
 
-**输入**: C1.1（StreamingJSONParser）、A4.2（CLISink）、C2.1（AnthropicAdapter）
+**输入**: C1.1（StreamingJSONParser）、A4.2（CLISink）、C2.1（OpenAIAdapter）
 
-**修改文件**: `src/model/anthropic.py`
+**修改文件**: `src/model/openai.py`
 
 **实现逻辑**:
 
-`AnthropicAdapter.next_action_streaming()` 中向 `StreamingJSONParser` 注册 `$.params.content` 路径回调，每次收到 delta 时调用 `sink.on_text_chunk()`：
+`OpenAIAdapter.next_action_streaming()` 中向 `StreamingJSONParser` 注册 `$.params.content` 路径回调，每次收到 delta 时调用 `sink.on_text_chunk()`：
 
 ```python
 def next_action_streaming(self, messages: list[dict]) -> Action:
@@ -252,11 +245,13 @@ def next_action_streaming(self, messages: list[dict]) -> Action:
         "$.params.content": on_answer_chunk,   # 仅在 final_answer 时有内容
     })
 
-    with self._client.messages.stream(
+    with self._client.chat.completions.stream(
         model=self._model, max_tokens=self._max_tokens, messages=messages
     ) as stream:
-        for chunk in stream.text_stream:
-            parser.feed(chunk)
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            if delta:
+                parser.feed(delta)
 
     return parse_action_response(json.dumps(parser.get_result()))
 ```
@@ -400,7 +395,7 @@ def test_sse_sink_plan_updated_has_goal():
 
 ### 任务 C3.1: 端到端集成测试
 
-**目标**: 用真实 Anthropic API 跑通完整端到端流程
+**目标**: 用真实 OpenAI API 跑通完整端到端流程
 
 **输出文件**: `tests/integration/test_e2e.py`
 
@@ -429,17 +424,17 @@ uv run pytest tests/unit/test_streaming.py -v
 # SSESink 专项测试
 uv run pytest tests/unit/test_sse_sink.py -v
 
-# 集成测试（需设置 ANTHROPIC_API_KEY）
-ANTHROPIC_API_KEY=xxx uv run pytest tests/integration/ -v -m integration
+# 集成测试（需设置 OPENAI_API_KEY）
+OPENAI_API_KEY=xxx uv run pytest tests/integration/ -v -m integration
 
 # 端到端 CLI 测试（真实模型 + 流式输出）
-ANTHROPIC_API_KEY=xxx uv run skills-agent run --skill-root tests/fixtures/skills \
-    --model anthropic "请列出可用技能并描述第一个技能的用途"
+OPENAI_API_KEY=xxx uv run skills-agent run --skill-root tests/fixtures/skills \
+    --model openai "请列出可用技能并描述第一个技能的用途"
 # 预期：stderr 可见进度行，答案逐字打印到 stdout
 
 # Chat 模式 + 真实模型测试
-ANTHROPIC_API_KEY=xxx uv run skills-agent chat --skill-root tests/fixtures/skills \
-    --model anthropic
+OPENAI_API_KEY=xxx uv run skills-agent chat --skill-root tests/fixtures/skills \
+    --model openai
 # 输入多轮消息，验证历史上下文正确传递，流式答案逐字显示
 
 # 安全检查（同 Phase A/B）

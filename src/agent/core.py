@@ -10,7 +10,7 @@ from agent.events import EventLogger, EventType
 from agent.plan import Action, ActionType, Plan
 from agent.recovery import save_state
 from agent.state import AgentState
-from model.base import ModelAdapter
+from model.base import ModelAdapter, ModelResponseError
 from output.sink import NullSink, OutputSink
 from skills.loader import PathTraversalError, SkillLoader
 from skills.metadata import SkillMetadata
@@ -89,7 +89,22 @@ class AgentCore:
             state.turn_count += 1
 
             messages = self._build_context(state, history_messages, react_history)
-            action = self._model.next_action(messages)
+            self._sink.on_thinking_start(state.turn_count)
+            try:
+                if hasattr(self._model, "next_action_streaming"):
+                    action = self._model.next_action_streaming(messages)
+                    streaming = True
+                else:
+                    action = self._model.next_action(messages)
+                    streaming = False
+            except ModelResponseError as exc:
+                self._sink.on_error(f"Model response parse error: {exc}", recoverable=False)
+                self._logger.emit(EventType.ACTION_FAILED, {
+                    "turn": state.turn_count,
+                    "reason": "parse_error",
+                    "detail": str(exc),
+                })
+                break
 
             self._logger.emit(EventType.ACTION_REQUESTED, {
                 "turn": state.turn_count,
@@ -107,7 +122,7 @@ class AgentCore:
             # Track plan progress before/after action (for Phase B stall detection)
             old_statuses = {s.id: s.status for s in state.plan.steps} if state.plan else {}
 
-            observation = self._execute_action(action, state)
+            observation = self._execute_action(action, state, streaming=streaming)
 
             new_statuses = {s.id: s.status for s in state.plan.steps} if state.plan else {}
             if old_statuses != new_statuses:
@@ -157,7 +172,7 @@ class AgentCore:
             history_messages=history_messages,
         )
 
-    def _execute_action(self, action: Action, state: AgentState) -> str:
+    def _execute_action(self, action: Action, state: AgentState, streaming: bool = False) -> str:
         """Execute a single Action, return observation string for next context."""
 
         if action.type == ActionType.UPDATE_PLAN:
@@ -178,6 +193,11 @@ class AgentCore:
             state.active_skills.append(meta)
             self._sink.on_progress("load_skill", skill_name)
             self._logger.emit(EventType.SKILL_LOADED, {"skill": skill_name, **report})
+            # Display summary for user (not full body — that goes to model context only)
+            display_lines = [f"description: {meta.description}"]
+            if meta.allowed_tools:
+                display_lines.append(f"tools: {', '.join(meta.allowed_tools)}")
+            self._sink.on_observation(f"skill:{skill_name}", "\n".join(display_lines))
             return f"[Skill: {skill_name}]\n{body}"
 
         elif action.type == ActionType.LOAD_RESOURCE:
@@ -193,6 +213,7 @@ class AgentCore:
             except PathTraversalError as e:
                 return f"PathTraversalBlocked: {e}"
             self._sink.on_progress("load_resource", resource)
+            self._sink.on_observation(f"resource:{resource}", excerpt)
             return f"[Resource: {resource}]\n{excerpt}"
 
         elif action.type == ActionType.RUN_SCRIPT:
@@ -200,7 +221,8 @@ class AgentCore:
 
         elif action.type == ActionType.FINAL_ANSWER:
             content = action.params.get("content", "")
-            self._sink.on_text_chunk(content, done=True)
+            if not streaming:
+                self._sink.on_text_chunk(content, done=True)
             self._logger.emit(EventType.FINAL_ANSWER, {"content": content})
             state.status = "completed"
             return content
@@ -301,7 +323,9 @@ class AgentCore:
             obs_parts.append(f"stdout:\n{result.stdout}")
         if result.stderr:
             obs_parts.append(f"stderr:\n{result.stderr}")
-        return "\n".join(obs_parts)
+        obs = "\n".join(obs_parts)
+        self._sink.on_observation(f"script:{script}", obs)
+        return obs
 
     def _check_dead_loop_hash(self, action: Action, state: AgentState) -> bool:
         """
