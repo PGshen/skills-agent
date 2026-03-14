@@ -103,7 +103,7 @@ class TestFormatPlanSummary:
 # ---------------------------------------------------------------------------
 
 class TestThreeTurnLoop:
-    """MockModel drives UPDATE_PLAN → LOAD_SKILL → FINAL_ANSWER."""
+    """MockModel drives UPDATE_PLAN → LOAD_SKILL → UPDATE_PLAN(done) → FINAL_ANSWER."""
 
     def _make_actions(self) -> list[Action]:
         return [
@@ -115,6 +115,13 @@ class TestThreeTurnLoop:
                 ],
             }}),
             Action(type=ActionType.LOAD_SKILL, params={"skill_name": "example-skill"}),
+            Action(type=ActionType.UPDATE_PLAN, params={"plan": {
+                "goal": "test goal",
+                "steps": [
+                    {"id": "s1", "description": "load skill", "status": "done"},
+                    {"id": "s2", "description": "finish", "status": "done"},
+                ],
+            }}),
             Action(type=ActionType.FINAL_ANSWER, params={"content": "All done!"}),
         ]
 
@@ -124,11 +131,11 @@ class TestThreeTurnLoop:
         result = core.run("do the task")
         assert result == "All done!"
 
-    def test_model_called_three_times(self, tmp_path):
+    def test_model_called_four_times(self, tmp_path):
         model = MockModel(self._make_actions())
         core = make_core(model, tmp_path)
         core.run("do the task")
-        assert model.call_count == 3
+        assert model.call_count == 4
 
     def test_events_complete_sequence(self, tmp_path):
         model = MockModel(self._make_actions())
@@ -140,8 +147,8 @@ class TestThreeTurnLoop:
         assert types[0] == "session_start"
         assert types[-1] == "session_end"
 
-        assert types.count("action_requested") == 3
-        assert types.count("action_completed") == 3
+        assert types.count("action_requested") == 4
+        assert types.count("action_completed") == 4
         assert "plan_updated" in types
         assert "skill_loaded" in types
         assert "final_answer" in types
@@ -153,7 +160,7 @@ class TestThreeTurnLoop:
         events = read_events(tmp_path)
         session_end = events_of_type(events, "session_end")[0]
         assert session_end["data"]["status"] == "completed"
-        assert session_end["data"]["turns"] == 3
+        assert session_end["data"]["turns"] == 4
 
     def test_skill_in_active_skills(self, tmp_path):
         """After LOAD_SKILL, skill appears in agent state via events."""
@@ -226,6 +233,93 @@ class TestPlanUpdate:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Piggybacked plan_update on work actions
+# ---------------------------------------------------------------------------
+
+class TestPiggybackedPlanUpdate:
+    """plan_update inside a work action's params updates the plan without a separate turn."""
+
+    def test_load_skill_with_plan_update_marks_step_done(self, tmp_path):
+        """LOAD_SKILL with plan_update in params should update the plan in the same turn."""
+        actions = [
+            Action(type=ActionType.UPDATE_PLAN, params={"plan": {
+                "goal": "test",
+                "steps": [
+                    {"id": "s1", "description": "load skill", "status": "pending"},
+                    {"id": "s2", "description": "finish", "status": "pending"},
+                ],
+            }}),
+            Action(type=ActionType.LOAD_SKILL, params={
+                "skill_name": "example-skill",
+                "plan_update": {
+                    "goal": "test",
+                    "steps": [
+                        {"id": "s1", "description": "load skill", "status": "done"},
+                        {"id": "s2", "description": "finish", "status": "done"},
+                    ],
+                },
+            }),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "All done!"}),
+        ]
+        model = MockModel(actions)
+        core = make_core(model, tmp_path)
+        result = core.run("do the task")
+        assert result == "All done!"
+        assert model.call_count == 3
+
+    def test_piggybacked_plan_update_emits_plan_updated_event(self, tmp_path):
+        """plan_update piggyback should emit PLAN_UPDATED event."""
+        actions = [
+            Action(type=ActionType.UPDATE_PLAN, params={"plan": {
+                "goal": "test",
+                "steps": [{"id": "s1", "description": "load skill", "status": "pending"}],
+            }}),
+            Action(type=ActionType.LOAD_SKILL, params={
+                "skill_name": "example-skill",
+                "plan_update": {
+                    "goal": "test",
+                    "steps": [{"id": "s1", "description": "load skill", "status": "done"}],
+                },
+            }),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = make_core(model, tmp_path)
+        core.run("do the task")
+        events = read_events(tmp_path)
+        plan_events = events_of_type(events, "plan_updated")
+        # Two PLAN_UPDATED events: one from update_plan, one from the piggyback
+        assert len(plan_events) == 2
+        assert plan_events[1]["data"]["steps"][0]["status"] == "done"
+
+    def test_observation_includes_plan_updated_note(self, tmp_path):
+        """The observation for an action with plan_update should note the update."""
+        actions = [
+            Action(type=ActionType.UPDATE_PLAN, params={"plan": {
+                "goal": "test",
+                "steps": [{"id": "s1", "description": "load", "status": "pending"}],
+            }}),
+            Action(type=ActionType.LOAD_SKILL, params={
+                "skill_name": "example-skill",
+                "plan_update": {
+                    "goal": "test",
+                    "steps": [{"id": "s1", "description": "load", "status": "done"}],
+                },
+            }),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = make_core(model, tmp_path)
+        core.run("do the task")
+        events = read_events(tmp_path)
+        # Find the ACTION_COMPLETED event for LOAD_SKILL
+        load_events = [e for e in events if e["type"] == "action_completed"
+                       and e["data"]["action_type"] == "load_skill"]
+        assert len(load_events) == 1
+        assert "Plan updated" in load_events[0]["data"]["observation"]
+
+
+# ---------------------------------------------------------------------------
 # Tests: Skill not found
 # ---------------------------------------------------------------------------
 
@@ -264,6 +358,106 @@ class TestSkillNotFound:
         obs_msg = next(m for m in second_call_messages if m["role"] == "user"
                        and "Observation:" in m["content"])
         assert "Error: skill 'nonexistent-skill' not found." in obs_msg["content"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: Update plan observation text
+# ---------------------------------------------------------------------------
+
+class TestUpdatePlanObservation:
+    def test_update_plan_observation_mentions_no_real_work(self, tmp_path):
+        """UPDATE_PLAN observation must tell the model no real work was performed."""
+        actions = [
+            Action(type=ActionType.UPDATE_PLAN, params={"plan": {
+                "goal": "g", "steps": [],
+            }}),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = make_core(model, tmp_path)
+        core.run("test")
+
+        second_messages = model.call_history[1]
+        obs = next(m for m in second_messages if "Observation:" in m.get("content", ""))
+        assert "No actual work was performed" in obs["content"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: Stall detection (update_plan loop)
+# ---------------------------------------------------------------------------
+
+class TestStallDetection:
+    """After dead_loop_stall_turns consecutive update_plan actions, inject a warning."""
+
+    def _up(self, step_id: str, status: str) -> Action:
+        """Helper: unique update_plan action (distinct params → distinct hash)."""
+        return Action(type=ActionType.UPDATE_PLAN, params={"plan": {
+            "goal": "g",
+            "steps": [{"id": step_id, "description": "d", "status": status}],
+        }})
+
+    def test_stall_injection_appears_after_threshold(self, tmp_path):
+        """After 4 consecutive update_plan turns, next context includes stall warning."""
+        actions = [
+            self._up("s1", "pending"),
+            self._up("s1", "in_progress"),
+            self._up("s1", "done"),
+            self._up("s2", "pending"),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = make_core(model, tmp_path)
+        core.run("test")
+
+        # The 5th model call (for FINAL_ANSWER turn) should have the stall injection
+        fifth_messages = model.call_history[4]
+        stall_msgs = [m for m in fifth_messages if "Error:" in m.get("content", "")
+                      and "update_plan" in m.get("content", "").lower()
+                      and m["role"] == "user"]
+        assert len(stall_msgs) == 1
+        assert "write_file" in stall_msgs[0]["content"]
+
+    def test_no_stall_injection_below_threshold(self, tmp_path):
+        """Fewer than dead_loop_stall_turns consecutive update_plan → no stall warning."""
+        actions = [
+            self._up("s1", "pending"),
+            self._up("s1", "in_progress"),
+            self._up("s1", "done"),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = make_core(model, tmp_path)
+        core.run("test")
+
+        fourth_messages = model.call_history[3]
+        stall_msgs = [m for m in fourth_messages if "Error:" in m.get("content", "")
+                      and "update_plan" in m.get("content", "").lower()
+                      and m["role"] == "user"]
+        assert len(stall_msgs) == 0
+
+    def test_stall_resets_after_real_work(self, tmp_path):
+        """A non-update_plan action resets the stall counter."""
+        # 3 update_plans, then load_skill, then 3 more update_plans → no stall (only 3 consecutive)
+        actions = [
+            self._up("s1", "pending"),
+            self._up("s1", "in_progress"),
+            self._up("s1", "done"),
+            Action(type=ActionType.LOAD_SKILL, params={"skill_name": "example-skill"}),
+            self._up("s2", "pending"),
+            self._up("s2", "in_progress"),
+            self._up("s2", "done"),
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "done"}),
+        ]
+        model = MockModel(actions)
+        core = make_core(model, tmp_path)
+        core.run("test")
+
+        # 8th model call: last 3 consecutive are update_plan, below threshold of 4 → no injection
+        eighth_messages = model.call_history[7]
+        stall_msgs = [m for m in eighth_messages if "Error:" in m.get("content", "")
+                      and "update_plan" in m.get("content", "").lower()
+                      and m["role"] == "user"]
+        assert len(stall_msgs) == 0
 
 
 # ---------------------------------------------------------------------------

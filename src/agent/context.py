@@ -6,36 +6,88 @@ from agent.plan import Action, Plan
 from agent.state import AgentState
 from skills.registry import SkillRegistry
 
-SYSTEM_PROMPT_TEMPLATE = """You are an AI Agent that completes user tasks via a ReAct loop (Reason → Act → Observe).
+_SYSTEM_PROMPT_HEADER = """You are an AI Agent. Complete the user's task by executing tool actions.
 
 CRITICAL: Every reply MUST be a single valid JSON object. No prose, no markdown, no explanation outside the JSON.
 
-## Available Skills
-{skill_index}
+## How to complete tasks
+Use the tools below to produce REAL outputs. Examples:
+- User asks to write a file → call write_file with the actual file content in "content"
+- User asks to search → call web_search
+- User asks to run code → call run_script
 
-## Current Plan
-{plan_summary}
+## !! update_plan does NOT produce any real output !!
+update_plan is bookkeeping only. It does NOT write files, run code, or complete any work.
+Calling update_plan when you should be calling write_file or run_script is WRONG and wastes turns.
 
-## Action Protocol
-Output exactly one JSON object per turn:
-{{
+## Output format
+One JSON object per turn:
+{
   "type": "<action_type>",
-  "params": {{ ... }}
-}}
+  "params": { <only the keys listed for that action type, no extras> }
+}
 
-Action types and their params:
-- "load_skill":    {{"skill_name": "<name>"}}
-- "load_resource": {{"skill_name": "<name>", "resource": "<filename>"}}
-- "run_script":    {{"skill_name": "<name>", "script": "<path>", "args": []}}
-- "update_plan":   {{"plan": {{"goal": "...", "steps": [...]}}}}
-- "final_answer":  {{"content": "<complete answer text>"}}
-
-## Rules
-- Output ONLY the JSON object — no text before or after it
-- load_resource / run_script require the skill to be loaded first via load_skill
-- update_plan replaces the entire plan (full replacement, not patch)
-- Use final_answer when you can answer directly; params.content must contain the full response
+## Available tools
 """
+
+_SYSTEM_PROMPT_PLAN_SECTION = """
+## Plan bookkeeping (optional, use sparingly)
+- "update_plan":  {"plan": {"goal": "...", "steps": [...]}}  — track task progress only
+- "final_answer": {"content": "<complete answer text>"}  — call when all work is done
+
+### Efficiency tip: piggyback plan_update on work actions
+Instead of a separate update_plan turn, include "plan_update" inside any work action's params:
+{"type": "write_file", "params": {"path": "...", "content": "...", "plan_update": {"goal": "...", "steps": [{"id": "1", "status": "done"}]}}}
+
+"""
+
+_SYSTEM_PROMPT_RULES = """
+## Rules
+- Output ONLY the JSON object — no extra keys, no null-valued keys
+- load_resource / run_script require the skill to be loaded first via load_skill
+- DO NOT call update_plan instead of doing actual work
+- DO NOT call final_answer while the plan has steps in "pending" or "in_progress" status
+- Call final_answer only when all real work is done; params.content must contain the full response
+"""
+
+# Per-tool declaration lines (shown only when the tool is available)
+_TOOL_DECLARATIONS: dict[str, str] = {
+    "load_skill":    '- "load_skill":    {"skill_name": "<name>"}',
+    "load_resource": '- "load_resource": {"skill_name": "<name>", "resource": "<filename>"}',
+    "run_script":    '- "run_script":    {"skill_name": "<name>", "script": "<path>", "args": []}',
+    "read_file":     '- "read_file":     {"path": "<path>", "max_bytes": 100000}',
+    "list_dir":      '- "list_dir":      {"path": "<directory>", "max_entries": 100}',
+    "grep":          '- "grep":          {"pattern": "<regex>", "path": "<directory or file>", "max_results": 50}',
+    "write_file":    '- "write_file":    {"path": "<path>", "content": "<full file content>"}  [requires user approval]',
+    "delete_file":   '- "delete_file":   {"path": "<path>"}  [requires user approval]',
+    "web_search":    '- "web_search":    {"query": "<search query>", "max_results": 5}',
+}
+
+# Grouping: section header → tool names in order
+_TOOL_SECTIONS: list[tuple[str, list[str]]] = [
+    ("Skill actions:", ["load_skill", "load_resource", "run_script"]),
+    ("File tools (low-risk):", ["read_file", "list_dir", "grep"]),
+    ("Write tools (high-risk):", ["write_file", "delete_file"]),
+    ("Web:", ["web_search"]),
+]
+
+
+def _build_tools_section(available_tools: list[str]) -> str:
+    """Render only the tool declarations that are in available_tools."""
+    # Skill actions (load_skill / load_resource) are always present — they are
+    # not in ToolsRuntime but are core ReAct actions.
+    always_available = {"load_skill", "load_resource"}
+    effective = set(available_tools) | always_available
+
+    lines: list[str] = []
+    for header, tools in _TOOL_SECTIONS:
+        section_lines = [
+            _TOOL_DECLARATIONS[t] for t in tools if t in effective
+        ]
+        if section_lines:
+            lines.append(header)
+            lines.extend(section_lines)
+    return "\n".join(lines)
 
 _MIN_REACT_TURNS = 3
 _OBS_TRUNCATE_CHARS = 500
@@ -70,6 +122,8 @@ class ContextBuilder:
         registry: SkillRegistry,
         react_history: list[tuple],
         history_messages: list[dict],
+        available_tools: Optional[list[str]] = None,
+        stall_injection: Optional[str] = None,
     ) -> list[dict]:
         """
         Build the full messages list.
@@ -77,12 +131,18 @@ class ContextBuilder:
 
         react_history: list of (action_dict_or_str, observation_str) tuples
         history_messages: cross-task session history from SessionContext
+        available_tools: tools actually configured; None means show all tool types
         """
         skill_index = registry.to_index_text()
         plan_sum = _plan_summary(state.plan)
-        system_content = SYSTEM_PROMPT_TEMPLATE.format(
-            skill_index=skill_index,
-            plan_summary=plan_sum,
+        tools_section = _build_tools_section(available_tools if available_tools is not None else list(_TOOL_DECLARATIONS))
+        system_content = (
+            _SYSTEM_PROMPT_HEADER
+            + tools_section
+            + _SYSTEM_PROMPT_PLAN_SECTION
+            + "## Current progress\n" + plan_sum + "\n"
+            + "\n## Available Skills\n" + skill_index + "\n"
+            + _SYSTEM_PROMPT_RULES
         )
 
         msgs: list[dict] = []
@@ -93,6 +153,12 @@ class ContextBuilder:
         # ── Session history layer (compressed summary + recent turns) ─
         # history_messages is already formatted [{"role": ..., "content": ...}, ...]
         msgs.extend(history_messages)
+
+        # ── Current user input ───────────────────────────────────
+        msgs.append({"role": "user", "content": state.user_input})
+
+        # Mark end of fixed prefix (system + history + user_input)
+        fixed_count = len(msgs)
 
         # ── ReAct history ────────────────────────────────────────
         for action, observation in react_history:
@@ -107,57 +173,54 @@ class ContextBuilder:
             msgs.append({"role": "assistant", "content": action_content})
             msgs.append({"role": "user", "content": f"Observation: {observation}"})
 
-        # ── Current user input ───────────────────────────────────
-        msgs.append({"role": "user", "content": state.user_input})
+        # ── Stall injection (appended last so the model sees it immediately) ──
+        if stall_injection:
+            msgs.append({"role": "user", "content": stall_injection})
 
         total = sum(self._msg_tokens(m) for m in msgs)
         if total > self._max_tokens:
-            msgs = self._trim_to_limit(msgs, self._max_tokens)
+            msgs = self._trim_to_limit(msgs, self._max_tokens, fixed_count=fixed_count)
 
         return msgs
 
-    def _trim_to_limit(self, msgs: list[dict], max_tokens: int) -> list[dict]:
+    def _trim_to_limit(self, msgs: list[dict], max_tokens: int, fixed_count: int = 1) -> list[dict]:
         """
         Trimming strategy (least to most aggressive):
         1. Truncate observation content (keep first 500 chars)
         2. Drop oldest ReAct history turns (keep most recent 3)
         3. Truncate loaded skill body content (keep summary line)
 
-        Never drop: system message, current user_input, plan summary, skill index.
+        Never drop: fixed prefix (system + history_messages + user_input).
+        fixed_count: number of messages at the start that must not be trimmed.
         """
-        # Identify fixed messages: system (index 0) and last user_input (index -1)
-        # Everything in between is trimmable.
-        if len(msgs) < 2:
+        if len(msgs) <= fixed_count:
             return msgs
 
-        system_msg = msgs[0]
-        current_input_msg = msgs[-1]
-        middle = list(msgs[1:-1])
+        fixed = msgs[:fixed_count]
+        react = list(msgs[fixed_count:])
 
         # ── Step 1: Truncate observations ─────────────────────────
-        for i, msg in enumerate(middle):
+        for i, msg in enumerate(react):
             content = msg.get("content", "")
             if isinstance(content, str) and content.startswith("Observation: "):
                 body = content[len("Observation: "):]
                 if len(body) > _OBS_TRUNCATE_CHARS:
-                    middle[i] = {
+                    react[i] = {
                         **msg,
                         "content": "Observation: " + body[:_OBS_TRUNCATE_CHARS] + "…[truncated]",
                     }
 
-        candidate = [system_msg] + middle + [current_input_msg]
+        candidate = fixed + react
         if sum(self._msg_tokens(m) for m in candidate) <= max_tokens:
             return candidate
 
         # ── Step 2: Drop oldest ReAct pairs, keep at least MIN_REACT_TURNS ──
-        # ReAct pairs in `middle` are consecutive (assistant, user[Observation]) pairs.
-        # We need to keep the non-ReAct history_messages intact and only drop
-        # the oldest ReAct pairs.
-        react_pairs: list[tuple[int, int]] = []  # (assistant_idx, observation_idx) in middle
+        # react contains consecutive (assistant, user[Observation]) pairs only.
+        react_pairs: list[tuple[int, int]] = []  # (assistant_idx, observation_idx) in react
         i = 0
-        while i < len(middle) - 1:
-            a = middle[i]
-            b = middle[i + 1]
+        while i < len(react) - 1:
+            a = react[i]
+            b = react[i + 1]
             if (
                 a.get("role") == "assistant"
                 and b.get("role") == "user"
@@ -177,19 +240,18 @@ class ContextBuilder:
             dropped_indices.add(ai)
             dropped_indices.add(oi)
 
-        middle = [m for idx, m in enumerate(middle) if idx not in dropped_indices]
+        react = [m for idx, m in enumerate(react) if idx not in dropped_indices]
 
-        candidate = [system_msg] + middle + [current_input_msg]
+        candidate = fixed + react
         if sum(self._msg_tokens(m) for m in candidate) <= max_tokens:
             return candidate
 
-        # ── Step 3: Truncate skill body content (assistant messages that are not
-        #    observations, i.e., loaded skill bodies injected as user messages) ──
-        for i, msg in enumerate(middle):
+        # ── Step 3: Truncate skill body observations ──────────────
+        for i, msg in enumerate(react):
             content = msg.get("content", "")
             if isinstance(content, str) and msg.get("role") == "user":
                 if not content.startswith("Observation: ") and len(content) > _OBS_TRUNCATE_CHARS:
                     first_line = content.split("\n")[0]
-                    middle[i] = {**msg, "content": first_line + "\n…[truncated]"}
+                    react[i] = {**msg, "content": first_line + "\n…[truncated]"}
 
-        return [system_msg] + middle + [current_input_msg]
+        return fixed + react

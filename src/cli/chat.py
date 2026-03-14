@@ -12,7 +12,7 @@ from skills.loader import SkillLoader
 
 def run_chat(args) -> None:
     """Interactive chat mode main loop."""
-    from cli.main import _build_event_logger, _build_model, _build_registry
+    from cli.main import _build_event_logger, _build_model, _build_registry, _build_tools_runtime
 
     cfg = get_config()
 
@@ -46,6 +46,7 @@ def run_chat(args) -> None:
     print(f"{_dim}Type 'exit' or Ctrl+C to quit.{_reset}\n")
 
     model = _build_model(args, sink=sink)
+    tools = _build_tools_runtime(cfg)
 
     # One compressor instance for the whole session; reuses the same model adapter.
     compressor = ConversationCompressor(
@@ -63,6 +64,7 @@ def run_chat(args) -> None:
             break
 
         if user_input.lower() in ("exit", "quit", "q"):
+            print(f"\n{_dim}Goodbye.{_reset}")
             break
         if not user_input:
             continue
@@ -72,6 +74,7 @@ def run_chat(args) -> None:
             registry=registry,
             loader=loader,
             event_logger=event_logger,
+            tools=tools,
             sink=sink,
             max_turns=cfg.agent.max_turns,
             dead_loop_window=cfg.agent.dead_loop_window,

@@ -72,13 +72,13 @@ class TestBuildMessageOrder:
         cb = ContextBuilder()
         msgs = cb.build(state, reg, react_history=react, history_messages=history)
 
-        # system, hist_user, hist_asst, react_asst, react_obs, user_input
+        # system, hist_user, hist_asst, user_input, react_asst, react_obs
         assert msgs[0]["role"] == "system"
         assert msgs[1]["content"] == "prev question"
         assert msgs[2]["content"] == "prev answer"
-        assert msgs[3]["role"] == "assistant"  # react action
-        assert msgs[4]["content"].startswith("Observation: ")
-        assert msgs[-1]["content"] == state.user_input
+        assert msgs[3]["content"] == state.user_input  # user_input before react
+        assert msgs[4]["role"] == "assistant"  # react action
+        assert msgs[5]["content"].startswith("Observation: ")
 
     def test_react_pairs_interleaved_correctly(self, tmp_path):
         reg = _make_registry(tmp_path)
@@ -87,13 +87,13 @@ class TestBuildMessageOrder:
         cb = ContextBuilder()
         msgs = cb.build(state, reg, react_history=react, history_messages=[])
 
-        # system, (asst, obs) * 2, user_input
-        assert msgs[1]["role"] == "assistant"
-        assert msgs[2]["role"] == "user"
-        assert msgs[2]["content"].startswith("Observation: ")
-        assert msgs[3]["role"] == "assistant"
-        assert msgs[4]["content"].startswith("Observation: ")
-        assert msgs[-1]["content"] == state.user_input
+        # system, user_input, (asst, obs) * 2
+        assert msgs[1]["content"] == state.user_input  # user_input before react
+        assert msgs[2]["role"] == "assistant"
+        assert msgs[3]["role"] == "user"
+        assert msgs[3]["content"].startswith("Observation: ")
+        assert msgs[4]["role"] == "assistant"
+        assert msgs[5]["content"].startswith("Observation: ")
 
     def test_plan_summary_in_system_prompt(self, tmp_path):
         reg = _make_registry(tmp_path)
@@ -155,7 +155,8 @@ class TestTrimToLimit:
         msgs = cb.build(state, reg, react_history=react, history_messages=[])
 
         assert msgs[0]["role"] == "system"
-        assert msgs[-1]["content"] == state.user_input
+        # user_input is at index 1 (after system, before any react history)
+        assert msgs[1]["content"] == state.user_input
 
     def test_observation_truncated_when_over_budget(self, tmp_path):
         reg = _make_registry(tmp_path)

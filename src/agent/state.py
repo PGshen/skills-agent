@@ -24,8 +24,4 @@ class AgentState(BaseModel):
     def is_done(self) -> bool:
         if self.dead_loop_triggered:
             return True
-        if self.status == "completed":
-            return True
-        if self.plan is None:
-            return False
-        return all(s.status in ("done", "failed") for s in self.plan.steps)
+        return self.status == "completed"

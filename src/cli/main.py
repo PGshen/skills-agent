@@ -46,6 +46,22 @@ def _build_model(args, sink=None):
     )
 
 
+def _build_tools_runtime(cfg: Config):
+    """Instantiate ToolsRuntime from config, wiring up the web search adapter if configured."""
+    from tools.runtime import ToolsRuntime
+
+    web_adapter = None
+    if cfg.tools.tavily_api_key:
+        from tools.executor import TavilyAdapter
+        web_adapter = TavilyAdapter(api_key=cfg.tools.tavily_api_key)
+
+    return ToolsRuntime(
+        global_allowed_tools=cfg.tools.allowed_tools,
+        interactive=cfg.tools.interactive,
+        web_search_adapter=web_adapter,
+    )
+
+
 def _build_registry(skill_root: str):
     from skills.registry import SkillRegistry
 

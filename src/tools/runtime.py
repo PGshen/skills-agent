@@ -1,14 +1,19 @@
 """ToolsRuntime: main tools runtime."""
 from pathlib import Path
+from typing import Optional
 
 from skills.metadata import SkillMetadata
 from tools.approval import ApprovalManager, ApprovalRequest
 from tools.executor import (
+    DeleteFileExecutor,
     GrepExecutor,
     ListDirExecutor,
     ReadFileExecutor,
     ScriptExecutor,
     ScriptResult,
+    WebSearchAdapter,
+    WebSearchExecutor,
+    WriteFileExecutor,
 )
 from tools.permissions import PermissionChecker
 
@@ -56,12 +61,29 @@ class ToolsRuntime:
         self,
         global_allowed_tools: list[str] | None = None,
         interactive: bool = True,
+        web_search_adapter: Optional[WebSearchAdapter] = None,
     ):
         self._permission = PermissionChecker(
-            global_allowed_tools or ["read_file", "list_dir", "grep", "run_script"]
+            global_allowed_tools or [
+                "read_file", "list_dir", "grep", "run_script",
+                "write_file", "delete_file", "web_search",
+            ]
         )
         self._approval = ApprovalManager(interactive=interactive)
         self._script_executor = ScriptExecutor()
+        self._web_search: Optional[WebSearchExecutor] = (
+            WebSearchExecutor(web_search_adapter) if web_search_adapter else None
+        )
+
+    def available_tools(self) -> list[str]:
+        """
+        Return the list of tools that are both permitted and actually configured.
+        web_search is excluded when no adapter is provided.
+        """
+        tools = list(self._permission._global)
+        if "web_search" in tools and self._web_search is None:
+            tools.remove("web_search")
+        return sorted(tools)
 
     # ------------------------------------------------------------------
     # run_script
@@ -128,6 +150,72 @@ class ToolsRuntime:
         return GrepExecutor().run(
             pattern=pattern, root=Path(path), max_results=max_results
         )
+
+    def web_search(self, query: str, max_results: int = 5) -> dict:
+        """
+        Search the web. Low-risk, no approval required.
+        Returns {"results": [...]} or {"error": "..."}.
+        Requires a WebSearchAdapter to be configured at init time.
+        """
+        if self._web_search is None:
+            return {"error": "web_search not configured (no adapter provided)"}
+        result = self._web_search.run(query, max_results=max_results)
+        if result.error:
+            return {"error": result.error}
+        return {
+            "results": [
+                {"title": r.title, "url": r.url, "content": r.content}
+                for r in result.results
+            ]
+        }
+
+    # ------------------------------------------------------------------
+    # Write tools (high-risk, require permission + approval)
+    # ------------------------------------------------------------------
+
+    def write_file(self, path: str, content: str) -> dict:
+        """
+        Write content to a file. High-risk, requires approval.
+        Returns {"success": True} or {"error": "..."}.
+        """
+        if not self._permission.check("write_file"):
+            raise ToolNotAllowedError("write_file is not in the allowed tool set")
+
+        req = ApprovalRequest(
+            tool="write_file",
+            risk="high",
+            params={"path": path, "preview": content[:200]},
+            skill_name="",
+        )
+        if not self._approval.request(req):
+            raise ApprovalDeniedError("User denied write_file approval")
+
+        result = WriteFileExecutor().run(Path(path), content)
+        if not result.success:
+            return {"error": result.error}
+        return {"success": True}
+
+    def delete_file(self, path: str) -> dict:
+        """
+        Delete a file. High-risk, requires approval.
+        Returns {"success": True} or {"error": "..."}.
+        """
+        if not self._permission.check("delete_file"):
+            raise ToolNotAllowedError("delete_file is not in the allowed tool set")
+
+        req = ApprovalRequest(
+            tool="delete_file",
+            risk="high",
+            params={"path": path},
+            skill_name="",
+        )
+        if not self._approval.request(req):
+            raise ApprovalDeniedError("User denied delete_file approval")
+
+        result = DeleteFileExecutor().run(Path(path))
+        if not result.success:
+            return {"error": result.error}
+        return {"success": True}
 
     # ------------------------------------------------------------------
     # Internals

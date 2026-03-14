@@ -1,8 +1,10 @@
 """Permission merging and enforcement."""
+from typing import Optional
+
 from skills.metadata import SkillMetadata
 
 # Tools that require explicit user approval before execution
-_APPROVAL_REQUIRED = {"run_script", "write_file", "delete_file", "network_request"}
+_APPROVAL_REQUIRED = {"run_script", "write_file", "delete_file"}
 
 
 class PermissionChecker:
@@ -19,9 +21,10 @@ class PermissionChecker:
     def __init__(self, global_allowed_tools: list[str]):
         self._global: set[str] = set(global_allowed_tools)
 
-    def check(self, tool_name: str, skill_meta: SkillMetadata) -> bool:
+    def check(self, tool_name: str, skill_meta: Optional[SkillMetadata] = None) -> bool:
         """
-        Return True if *tool_name* is permitted for *skill_meta*.
+        Return True if *tool_name* is permitted.
+        skill_meta is optional; when provided, its allowed_tools further restricts the set.
         False means the call must be rejected (ToolNotAllowedError).
         True still does not mean execution is immediate — approval may be needed.
         """
@@ -29,8 +32,8 @@ class PermissionChecker:
         if tool_name not in self._global:
             return False
 
-        # Skill's allowed_tools declaration further restricts the set
-        if skill_meta.allowed_tools:
+        # Skill's allowed_tools declaration further restricts the set (if skill context given)
+        if skill_meta is not None and skill_meta.allowed_tools:
             if tool_name not in skill_meta.allowed_tools:
                 return False
 

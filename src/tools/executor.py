@@ -188,3 +188,120 @@ class GrepExecutor:
             return {"error": str(exc)}
 
         return {"matches": matches, "truncated": False}
+
+
+# ---------------------------------------------------------------------------
+# Write / delete tool executors
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WriteFileResult:
+    success: bool
+    error: str = ""
+
+
+@dataclass
+class DeleteFileResult:
+    success: bool
+    error: str = ""
+
+
+class WriteFileExecutor:
+    """Write (or overwrite) a file, creating parent directories as needed."""
+
+    def run(self, path: Path, content: str) -> WriteFileResult:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            return WriteFileResult(success=True)
+        except PermissionError as exc:
+            return WriteFileResult(success=False, error=f"Permission denied: {exc}")
+        except Exception as exc:
+            return WriteFileResult(success=False, error=str(exc))
+
+
+class DeleteFileExecutor:
+    """Delete a single file (does not delete directories)."""
+
+    def run(self, path: Path) -> DeleteFileResult:
+        try:
+            if path.is_dir():
+                return DeleteFileResult(success=False, error=f"Path is a directory: {path}")
+            path.unlink()
+            return DeleteFileResult(success=True)
+        except FileNotFoundError:
+            return DeleteFileResult(success=False, error=f"File not found: {path}")
+        except PermissionError as exc:
+            return DeleteFileResult(success=False, error=f"Permission denied: {exc}")
+        except Exception as exc:
+            return DeleteFileResult(success=False, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Web search executor + adapters
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SearchResult:
+    title: str
+    url: str
+    content: str
+
+
+@dataclass
+class WebSearchResult:
+    results: list
+    error: str = ""
+
+
+class WebSearchAdapter:
+    """Base class for web search adapters. Subclass and override search()."""
+
+    def search(self, query: str, max_results: int = 5) -> WebSearchResult:
+        raise NotImplementedError
+
+
+class TavilyAdapter(WebSearchAdapter):
+    """Web search adapter backed by the Tavily Search API."""
+
+    _BASE_URL = "https://api.tavily.com/search"
+
+    def __init__(self, api_key: str):
+        self._api_key = api_key
+
+    def search(self, query: str, max_results: int = 5) -> WebSearchResult:
+        import requests
+        try:
+            resp = requests.post(
+                self._BASE_URL,
+                json={
+                    "api_key": self._api_key,
+                    "query": query,
+                    "max_results": max_results,
+                    "include_answer": False,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = [
+                SearchResult(
+                    title=r.get("title", ""),
+                    url=r.get("url", ""),
+                    content=r.get("content", ""),
+                )
+                for r in data.get("results", [])
+            ]
+            return WebSearchResult(results=results)
+        except Exception as exc:
+            return WebSearchResult(results=[], error=str(exc))
+
+
+class WebSearchExecutor:
+    """Delegates web search to a pluggable WebSearchAdapter."""
+
+    def __init__(self, adapter: WebSearchAdapter):
+        self._adapter = adapter
+
+    def run(self, query: str, max_results: int = 5) -> WebSearchResult:
+        return self._adapter.search(query, max_results=max_results)

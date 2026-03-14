@@ -8,7 +8,7 @@ from skills.loader import SkillLoader
 
 def cmd_run(args) -> int:
     """Execute `skills-agent run`."""
-    from cli.main import _build_model, _build_registry, _build_run_dir_and_logger
+    from cli.main import _build_model, _build_registry, _build_run_dir_and_logger, _build_tools_runtime
 
     cfg = get_config()
     registry = _build_registry(args.skill_root)
@@ -39,12 +39,14 @@ def cmd_run(args) -> int:
         resume_messages = []
 
     model = _build_model(args, sink=sink)
+    tools = _build_tools_runtime(cfg)
 
     core = AgentCore(
         model=model,
         registry=registry,
         loader=loader,
         event_logger=event_logger,
+        tools=tools,
         sink=sink,
         run_dir=run_dir,
         max_turns=cfg.agent.max_turns,

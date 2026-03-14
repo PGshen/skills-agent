@@ -88,7 +88,22 @@ class AgentCore:
         while not state.is_done() and state.turn_count < self._max_turns:
             state.turn_count += 1
 
-            messages = self._build_context(state, history_messages, react_history)
+            # Detect update_plan stall: N consecutive update_plan with no real work
+            stall_injection = None
+            if len(react_history) >= self._dead_loop_stall_turns:
+                recent = react_history[-self._dead_loop_stall_turns:]
+                if all(
+                    isinstance(a, Action) and a.type == ActionType.UPDATE_PLAN
+                    for a, _ in recent
+                ):
+                    stall_injection = (
+                        f"Error: you have called update_plan {self._dead_loop_stall_turns} times "
+                        "in a row without doing any real work. "
+                        "Your next action MUST be write_file, run_script, web_search, read_file, "
+                        "or another work tool. Do NOT call update_plan again."
+                    )
+
+            messages = self._build_context(state, history_messages, react_history, stall_injection=stall_injection)
             self._logger.emit(EventType.MODEL_REQUEST, {
                 "turn": state.turn_count,
                 "message_count": len(messages),
@@ -132,6 +147,7 @@ class AgentCore:
             old_statuses = {s.id: s.status for s in state.plan.steps} if state.plan else {}
 
             observation = self._execute_action(action, state, streaming=streaming)
+            observation = self._apply_piggybacked_plan(action, state, observation)
 
             new_statuses = {s.id: s.status for s in state.plan.steps} if state.plan else {}
             if old_statuses != new_statuses:
@@ -172,14 +188,37 @@ class AgentCore:
         state: AgentState,
         history_messages: list[dict],
         react_history: list[tuple[Action, str]],
+        stall_injection: Optional[str] = None,
     ) -> list[dict]:
         """Assemble the messages list for the current turn."""
+        available_tools = self._tools.available_tools() if self._tools is not None else []
         return self._context_builder.build(
             state=state,
             registry=self._registry,
             react_history=react_history,
             history_messages=history_messages,
+            available_tools=available_tools,
+            stall_injection=stall_injection,
         )
+
+    def _apply_piggybacked_plan(self, action: Action, state: AgentState, observation: str) -> str:
+        """
+        If action.params contains "plan_update", apply it and append a note to the observation.
+        Not applicable to UPDATE_PLAN itself (it IS the plan action).
+        """
+        plan_data = action.params.get("plan_update")
+        if plan_data is None or action.type == ActionType.UPDATE_PLAN:
+            return observation
+        try:
+            new_plan = Plan.model_validate(plan_data)
+        except Exception:
+            return observation + "\n[Warning: plan_update ignored — invalid format]"
+        state.plan = state.plan.replace(new_plan) if state.plan else new_plan
+        self._sink.on_plan_updated(state.plan)
+        self._logger.emit(EventType.PLAN_UPDATED, state.plan.model_dump())
+        if self._run_dir is not None:
+            save_state(self._run_dir, state)
+        return observation + "\nPlan updated."
 
     def _execute_action(self, action: Action, state: AgentState, streaming: bool = False) -> str:
         """Execute a single Action, return observation string for next context."""
@@ -191,7 +230,10 @@ class AgentCore:
             self._logger.emit(EventType.PLAN_UPDATED, state.plan.model_dump())
             if self._run_dir is not None:
                 save_state(self._run_dir, state)
-            return "Plan updated."
+            return (
+                "Plan updated. No actual work was performed — "
+                "call write_file, run_script, or another work tool to do real tasks."
+            )
 
         elif action.type == ActionType.LOAD_SKILL:
             skill_name = action.params["skill_name"]
@@ -228,7 +270,77 @@ class AgentCore:
         elif action.type == ActionType.RUN_SCRIPT:
             return self._handle_run_script(action, state)
 
+        elif action.type == ActionType.READ_FILE:
+            return self._handle_read_only_tool(
+                action,
+                tool_name="read_file",
+                call=lambda: self._tools.read_file(
+                    path=action.params["path"],
+                    max_bytes=action.params.get("max_bytes", 100_000),
+                ),
+                fmt=lambda r: r["content"] + ("\n[truncated]" if r.get("truncated") else ""),
+            )
+
+        elif action.type == ActionType.LIST_DIR:
+            return self._handle_read_only_tool(
+                action,
+                tool_name="list_dir",
+                call=lambda: self._tools.list_dir(
+                    path=action.params["path"],
+                    max_entries=action.params.get("max_entries", 100),
+                ),
+                fmt=lambda r: "\n".join(r["entries"]) + ("\n[truncated]" if r.get("truncated") else ""),
+            )
+
+        elif action.type == ActionType.GREP:
+            return self._handle_read_only_tool(
+                action,
+                tool_name="grep",
+                call=lambda: self._tools.grep(
+                    pattern=action.params["pattern"],
+                    path=action.params["path"],
+                    max_results=action.params.get("max_results", 50),
+                ),
+                fmt=lambda r: "\n".join(
+                    f"{m['file']}:{m['line']}: {m['content']}" for m in r["matches"]
+                ) + ("\n[truncated]" if r.get("truncated") else ""),
+            )
+
+        elif action.type == ActionType.WEB_SEARCH:
+            query = action.params.get("query", "")
+            return self._handle_read_only_tool(
+                action,
+                tool_name="web_search",
+                call=lambda: self._tools.web_search(
+                    query=query,
+                    max_results=action.params.get("max_results", 5),
+                ),
+                fmt=lambda r: "\n\n".join(
+                    f"[{i+1}] {res['title']}\n{res['url']}\n{res['content']}"
+                    for i, res in enumerate(r["results"])
+                ) or "(no results)",
+            )
+
+        elif action.type == ActionType.WRITE_FILE:
+            return self._handle_write_tool(action)
+
+        elif action.type == ActionType.DELETE_FILE:
+            return self._handle_write_tool(action)
+
         elif action.type == ActionType.FINAL_ANSWER:
+            # Guard: reject final_answer if plan has incomplete steps
+            if state.plan is not None:
+                from agent.plan import StepStatus
+                incomplete = [
+                    s for s in state.plan.steps
+                    if s.status not in (StepStatus.DONE, StepStatus.FAILED)
+                ]
+                if incomplete:
+                    step_list = ", ".join(f"[{s.id}: {s.description}]" for s in incomplete)
+                    return (
+                        f"Error: cannot call final_answer while plan has incomplete steps: {step_list}. "
+                        "Complete all steps first, then call final_answer."
+                    )
             content = action.params.get("content", "")
             if not streaming:
                 self._sink.on_text_chunk(content, done=True)
@@ -334,6 +446,90 @@ class AgentCore:
             obs_parts.append(f"stderr:\n{result.stderr}")
         obs = "\n".join(obs_parts)
         self._sink.on_observation(f"script:{script}", obs)
+        return obs
+
+    def _handle_write_tool(self, action: Action) -> str:
+        """
+        Handle WRITE_FILE / DELETE_FILE actions: permission check → approval → execute.
+        Returns observation string in all cases (never raises).
+        """
+        if self._tools is None:
+            obs = f"Error: {action.type} not available (ToolsRuntime not configured)."
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": action.type,
+                "reason": "tools_not_configured",
+            })
+            return obs
+
+        try:
+            if action.type == ActionType.WRITE_FILE:
+                result = self._tools.write_file(
+                    path=action.params["path"],
+                    content=action.params["content"],
+                )
+                label = action.params["path"]
+            else:  # DELETE_FILE
+                result = self._tools.delete_file(path=action.params["path"])
+                label = action.params["path"]
+        except ToolNotAllowedError as exc:
+            obs = f"ToolNotAllowed: {exc}"
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": action.type, "reason": "permission_denied"})
+            self._sink.on_error(obs, recoverable=True)
+            return obs
+        except ApprovalDeniedError as exc:
+            obs = f"ApprovalDenied: {exc}"
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": action.type, "reason": "approval_denied"})
+            self._sink.on_error(obs, recoverable=True)
+            return obs
+
+        if "error" in result:
+            obs = f"Error: {result['error']}"
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": action.type,
+                "reason": "execution_error",
+                "detail": result["error"],
+            })
+            return obs
+
+        obs = f"{action.type} succeeded: {label}"
+        self._sink.on_progress(str(action.type), label)
+        return obs
+
+    def _handle_read_only_tool(
+        self,
+        action: Action,
+        tool_name: str,
+        call,
+        fmt,
+    ) -> str:
+        """
+        Generic handler for low-risk read-only tools (read_file, list_dir, grep).
+        No approval required; errors in the result dict are returned as observations.
+        """
+        if self._tools is None:
+            obs = f"Error: {tool_name} not available (ToolsRuntime not configured)."
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": action.type,
+                "reason": "tools_not_configured",
+            })
+            return obs
+
+        result = call()
+
+        if "error" in result:
+            obs = f"Error: {result['error']}"
+            self._logger.emit(EventType.ACTION_FAILED, {
+                "action_type": action.type,
+                "reason": "tool_error",
+                "detail": result["error"],
+            })
+            return obs
+
+        obs = fmt(result)
+        self._sink.on_progress(tool_name, action.params.get("path", ""))
+        self._sink.on_observation(f"{tool_name}:{action.params.get('path', '')}", obs)
         return obs
 
     def _check_dead_loop_hash(self, action: Action, state: AgentState) -> bool:

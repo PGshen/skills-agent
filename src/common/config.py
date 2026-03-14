@@ -58,12 +58,23 @@ class CLIConfig(BaseModel):
     log_file: Optional[str] = None   # Optional file path for log output
 
 
+class ToolsConfig(BaseModel):
+    """Tool execution settings."""
+    allowed_tools: list[str] = Field(default_factory=lambda: [
+        "read_file", "list_dir", "grep",
+        "run_script", "write_file", "delete_file", "web_search",
+    ])
+    interactive: bool = True         # Show approval prompts for high-risk tools
+    tavily_api_key: Optional[str] = None  # API key for web_search via Tavily
+
+
 class Config(BaseModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     compressor: CompressorConfig = Field(default_factory=CompressorConfig)
     cli: CLIConfig = Field(default_factory=CLIConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +157,12 @@ def _apply_env_overrides(data: dict) -> dict:
         cli["log_level"] = v
     if v := env.get("SKILLS_AGENT_LOG_FILE"):
         cli["log_file"] = v
+
+    tools = data.setdefault("tools", {})
+    if v := env.get("SKILLS_AGENT_TAVILY_API_KEY"):
+        tools["tavily_api_key"] = v
+    if v := env.get("SKILLS_AGENT_TOOLS_INTERACTIVE"):
+        tools["interactive"] = _str_to_bool(v)
 
     return data
 

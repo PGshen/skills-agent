@@ -48,6 +48,12 @@ class ActionType(str, Enum):
     LOAD_SKILL = "load_skill"        # 触发技能，加载 SKILL.md 正文
     LOAD_RESOURCE = "load_resource"  # 加载技能 resource 文件
     RUN_SCRIPT = "run_script"        # 执行技能脚本
+    READ_FILE = "read_file"          # 读取文件内容
+    LIST_DIR = "list_dir"            # 列举目录内容
+    GREP = "grep"                    # 正则搜索文件
+    WRITE_FILE = "write_file"        # 写入文件（需审批）
+    DELETE_FILE = "delete_file"      # 删除文件（需审批）
+    WEB_SEARCH = "web_search"        # 联网搜索
     UPDATE_PLAN = "update_plan"      # 全量替换当前计划
     FINAL_ANSWER = "final_answer"    # 结束输出最终答案
 

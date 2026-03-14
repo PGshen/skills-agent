@@ -100,6 +100,28 @@ JSON 文件，所有字段均为可选（只需写入需要覆盖的部分）：
 | `verbose` | bool | `false` | 在 stderr 显示 observation 详情 |
 | `color` | bool | `true` | 启用 ANSI 颜色输出 |
 
+### `tools` — 工具执行
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `allowed_tools` | string[] | 全部工具 | Agent 可使用的工具白名单 |
+| `interactive` | bool | `true` | 高风险工具（`write_file`/`delete_file`/`run_script`）执行前是否弹出审批提示 |
+| `tavily_api_key` | string \| null | `null` | Tavily Search API Key，配置后启用 `web_search` 工具 |
+
+**可用工具列表：**
+
+| 工具 | 风险 | 说明 |
+|------|------|------|
+| `read_file` | low | 读取文件内容 |
+| `list_dir` | low | 列举目录条目 |
+| `grep` | low | 正则搜索文件内容 |
+| `run_script` | medium | 执行技能目录内的脚本，需审批 |
+| `write_file` | high | 写入文件，需审批 |
+| `delete_file` | high | 删除文件，需审批 |
+| `web_search` | low | 联网搜索，需配置 `tavily_api_key` |
+
+> **注意**：`tavily_api_key` 建议通过环境变量 `SKILLS_AGENT_TAVILY_API_KEY` 注入，避免明文写入配置文件。
+
 ---
 
 ## 环境变量
@@ -123,6 +145,8 @@ JSON 文件，所有字段均为可选（只需写入需要覆盖的部分）：
 | `SKILLS_AGENT_LOG_DIR` | `paths.log_dir` | 路径字符串 |
 | `SKILLS_AGENT_VERBOSE` | `cli.verbose` | `1`/`true`/`yes` 表示启用 |
 | `SKILLS_AGENT_NO_COLOR` | `cli.color` | `1`/`true`/`yes` 表示**禁用**颜色 |
+| `SKILLS_AGENT_TAVILY_API_KEY` | `tools.tavily_api_key` | Tavily Search API Key |
+| `SKILLS_AGENT_TOOLS_INTERACTIVE` | `tools.interactive` | `1`/`true`/`yes` 表示启用审批提示 |
 
 ---
 
@@ -169,6 +193,36 @@ CLI 参数优先级最高，会覆盖配置文件和环境变量。默认值来�
   },
   "paths": {
     "skill_root": "./my-skills"
+  }
+}
+```
+
+### 启用 Web 搜索（Tavily）
+
+通过环境变量注入 API Key，避免密钥写入配置文件：
+
+```bash
+export SKILLS_AGENT_TAVILY_API_KEY=tvly-xxxx
+skills-agent run "search for recent Python 3.13 release notes"
+```
+
+或写入配置文件（仅限本地开发，勿提交到版本控制）：
+
+```json
+{
+  "tools": {
+    "tavily_api_key": "tvly-xxxx"
+  }
+}
+```
+
+### 限制可用工具（只读模式）
+
+```json
+{
+  "tools": {
+    "allowed_tools": ["read_file", "list_dir", "grep"],
+    "interactive": false
   }
 }
 ```

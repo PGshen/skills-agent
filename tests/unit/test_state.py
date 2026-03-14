@@ -35,12 +35,13 @@ def test_is_done_dead_loop_even_without_plan():
 
 
 def test_is_done_all_steps_done():
+    # Plan steps all done does NOT auto-complete — model must call final_answer
     plan = Plan(goal="g", steps=[
         Step(id="s1", description="first", status=StepStatus.DONE),
         Step(id="s2", description="second", status=StepStatus.FAILED),
     ])
     state = _make_state(plan=plan)
-    assert state.is_done() is True
+    assert state.is_done() is False
 
 
 def test_is_done_pending_step():
@@ -61,9 +62,10 @@ def test_is_done_in_progress_step():
 
 
 def test_is_done_empty_plan_steps():
+    # Empty plan steps does NOT auto-complete — model must call final_answer
     plan = Plan(goal="g", steps=[])
     state = _make_state(plan=plan)
-    assert state.is_done() is True  # all() on empty iterable is True
+    assert state.is_done() is False
 
 
 def test_defaults():
