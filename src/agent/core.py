@@ -5,6 +5,7 @@ from typing import Optional
 
 from agent.context import (
     ClassifyContextBuilder,
+    DirectAnswerContextBuilder,
     OrchestratorContextBuilder,
     _plan_summary as _format_plan_summary,  # noqa: F401 — re-export for tests
 )
@@ -15,6 +16,7 @@ from agent.plan import ActionType
 from agent.react_agent import ReactAgent
 from agent.state import AgentState
 from model.base import ModelAdapter, ModelResponseError
+from model.openai import build_action_response_format
 from output.sink import NullSink, OutputSink
 from skills.loader import SkillLoader
 from skills.registry import SkillRegistry
@@ -22,8 +24,10 @@ from skills.registry import SkillRegistry
 
 class AgentCore:
     """
-    Entry agent: classifies task complexity, then either answers directly (simple)
-    or delegates to OrchestratorAgent (complex).
+    Entry agent: classifies task complexity, then routes:
+      simple  → direct model call (one-shot answer with session history)
+      medium  → ReactAgent (tool use, single focused task)
+      complex → OrchestratorAgent (plan → execute → synthesize)
 
     Public interface is identical to the old AgentCore so CLI code needs no changes.
     """
@@ -106,7 +110,9 @@ class AgentCore:
         })
 
         if complexity == TaskComplexity.SIMPLE:
-            return self._run_simple(user_input, history_messages)
+            return self._run_direct(user_input, history_messages)
+        elif complexity == TaskComplexity.MEDIUM:
+            return self._run_medium(user_input, history_messages)
         else:
             return self._orchestrator.run(
                 user_input,
@@ -126,18 +132,44 @@ class AgentCore:
                 content = action.params.get("content", "").strip().lower()
                 if "simple" in content:
                     return TaskComplexity.SIMPLE
+                if "medium" in content:
+                    return TaskComplexity.MEDIUM
         except (ModelResponseError, Exception):
             pass
         return TaskComplexity.COMPLEX  # conservative default
 
-    def _run_simple(self, user_input: str, history_messages: list[dict]) -> str:
-        """Run a simple task through the ReactAgent (single-step, no planning)."""
+    def _run_direct(self, user_input: str, history_messages: list[dict]) -> str:
+        """Answer a simple question directly — one model call with session history."""
+        messages = DirectAnswerContextBuilder().build(user_input, history_messages)
+        response_format = build_action_response_format(["final_answer"])
+        self._sink.on_thinking_start(0, "Answering…")
+        try:
+            if hasattr(self._model, "next_action_streaming"):
+                action = self._model.next_action_streaming(messages, response_format=response_format)
+                # Streaming: sink.on_text_chunk already called inside next_action_streaming
+            else:
+                action = self._model.next_action(messages, response_format=response_format)
+            content = (
+                action.params.get("content", "")
+                if action.type == ActionType.FINAL_ANSWER
+                else str(action.params)
+            )
+            if not hasattr(self._model, "next_action_streaming"):
+                self._sink.on_text_chunk(content, done=True)
+        except (ModelResponseError, Exception) as exc:
+            content = f"Error: {exc}"
+            self._sink.on_text_chunk(content, done=True)
+        self._logger.emit(EventType.FINAL_ANSWER, {"content": content})
+        return content
+
+    def _run_medium(self, user_input: str, history_messages: list[dict]) -> str:
+        """Delegate a medium task to ReactAgent (tool use, single focused task)."""
         context = OrchestratorContextBuilder().build_subtask_context(
             prior_results=[],
             history_messages=history_messages,
         )
         task = SubTask(
-            step_id="simple-0",
+            step_id="medium-0",
             description=user_input,
             context=context,
             goal=user_input,

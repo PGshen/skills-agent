@@ -46,16 +46,21 @@ def _plan_summary(plan: Optional[Plan]) -> str:
 # ── ClassifyContextBuilder ────────────────────────────────────────────────────
 
 _CLASSIFY_PROMPT = """\
-Classify the following user request as "simple" or "complex".
+Classify the following user request as "simple", "medium", or "complex".
 
-simple: Can be answered immediately with general knowledge — no tools, no file writing needed.
+simple:  Can be answered immediately from general knowledge — no tools, no file reading needed.
   Examples: "What is quicksort?", "Translate this sentence", "Explain this error message"
 
-complex: Requires writing files, running code, web search, or involves multiple steps.
-  Examples: "Write a quicksort script and save it", "Search X and summarize", "Build Y feature"
+medium:  Requires using tools (read files, search) but is a single focused task.
+  Examples: "Find all TODO comments in this repo", "What does this function do?", "Search X and summarize"
+
+complex: Requires planning, writing files, or multiple distinct sequential steps.
+  Examples: "Write a quicksort script and save it", "Build Y feature", "Refactor module X and update tests"
 
 Output a single JSON object only:
 {{"type": "final_answer", "params": {{"content": "simple"}}}}
+or
+{{"type": "final_answer", "params": {{"content": "medium"}}}}
 or
 {{"type": "final_answer", "params": {{"content": "complex"}}}}
 
@@ -71,6 +76,24 @@ class ClassifyContextBuilder:
 
     def build(self, user_input: str) -> list[dict]:
         return [{"role": "user", "content": _CLASSIFY_PROMPT.format(user_input=user_input)}]
+
+
+# ── DirectAnswerContextBuilder ────────────────────────────────────────────────
+
+_DIRECT_ANSWER_SYSTEM = """\
+You are a helpful assistant. Answer the user's question directly and concisely.
+Output a single JSON object:
+{"type": "final_answer", "params": {"content": "<your answer>"}}"""
+
+
+class DirectAnswerContextBuilder:
+    """Builds messages for a direct (simple) answer — includes session history."""
+
+    def build(self, user_input: str, history_messages: list[dict]) -> list[dict]:
+        msgs: list[dict] = [{"role": "system", "content": _DIRECT_ANSWER_SYSTEM}]
+        msgs.extend(history_messages)
+        msgs.append({"role": "user", "content": user_input})
+        return msgs
 
 
 # ── OrchestratorContextBuilder ────────────────────────────────────────────────

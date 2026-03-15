@@ -53,6 +53,11 @@ def classify_simple() -> Action:
     return Action(type=ActionType.FINAL_ANSWER, params={"content": "simple"})
 
 
+def classify_medium() -> Action:
+    """Classification response: medium task."""
+    return Action(type=ActionType.FINAL_ANSWER, params={"content": "medium"})
+
+
 def classify_complex() -> Action:
     """Classification response: complex task."""
     return Action(type=ActionType.FINAL_ANSWER, params={"content": "complex"})
@@ -113,7 +118,7 @@ class TestSimpleRoute:
         """
         MockModel sequence:
           1. classify → "simple"
-          2. direct_answer → FINAL_ANSWER "quicksort is a divide-and-conquer..."
+          2. direct_answer (DirectAnswerContextBuilder) → FINAL_ANSWER "quicksort is..."
         """
         model = MockModel([
             classify_simple(),
@@ -155,10 +160,61 @@ class TestSimpleRoute:
         assert chunks == [("my answer", True)]
 
     def test_simple_classification_does_not_invoke_orchestrator(self, tmp_path):
-        """For simple tasks only 2 model calls happen: classify + direct_answer."""
+        """Simple tasks: only 2 model calls — classify + direct answer (no ReactAgent)."""
         model = MockModel([classify_simple(), final_answer("direct")])
         core = make_core(model, tmp_path)
         core.run("simple question")
+        assert model.call_count == 2
+
+    def test_simple_direct_answer_includes_history(self, tmp_path):
+        """History messages are injected into the direct-answer call for simple tasks."""
+        history = [
+            {"role": "user", "content": "prior question"},
+            {"role": "assistant", "content": "prior answer"},
+        ]
+        model = MockModel([classify_simple(), final_answer("answer")])
+        core = make_core(model, tmp_path)
+        core.run("follow-up question", history_messages=history)
+        # Direct answer call is the second call (index 1)
+        direct_msgs = model.call_history[1]
+        contents = [m["content"] for m in direct_msgs]
+        assert any("prior question" in c for c in contents)
+
+
+# ---------------------------------------------------------------------------
+# Classification: medium path
+# ---------------------------------------------------------------------------
+
+class TestMediumRoute:
+    def test_medium_route_returns_react_answer(self, tmp_path):
+        """
+        MockModel sequence:
+          1. classify → "medium"
+          2. ReactAgent → FINAL_ANSWER "found 3 TODOs"
+        """
+        model = MockModel([
+            classify_medium(),
+            final_answer("found 3 TODOs"),
+        ])
+        core = make_core(model, tmp_path)
+        result = core.run("Find all TODO comments in this repo")
+        assert result == "found 3 TODOs"
+        assert model.call_count == 2
+
+    def test_medium_route_emits_route_decision_event(self, tmp_path):
+        model = MockModel([classify_medium(), final_answer("answer")])
+        core = make_core(model, tmp_path)
+        core.run("something medium")
+        events = read_events(tmp_path)
+        route_events = events_of_type(events, "route_decision")
+        assert len(route_events) == 1
+        assert route_events[0]["data"]["complexity"] == "medium"
+
+    def test_medium_does_not_invoke_orchestrator(self, tmp_path):
+        """Medium: classify + react = 2 calls, no orchestrator decompose/synthesize."""
+        model = MockModel([classify_medium(), final_answer("result")])
+        core = make_core(model, tmp_path)
+        core.run("read and summarize file")
         assert model.call_count == 2
 
 
@@ -223,10 +279,10 @@ class TestComplexRoute:
 
 class TestClassificationFallback:
     def test_unknown_classification_defaults_to_complex(self, tmp_path):
-        """If model returns something other than 'simple', default to complex."""
+        """If model returns an unrecognised label, default to complex."""
         model = MockModel([
-            # Returns "medium" — not "simple" → defaults to complex
-            final_answer("medium"),
+            # Returns "banana" — not simple/medium/complex → defaults to complex
+            final_answer("banana"),
             decompose_action("goal", [
                 {"id": "1", "description": "do it", "status": "pending"},
             ]),

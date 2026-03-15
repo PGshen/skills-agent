@@ -7,8 +7,9 @@ from pydantic import BaseModel, Field
 
 
 class TaskComplexity(str, Enum):
-    SIMPLE = "simple"    # Can be answered directly with general knowledge
-    COMPLEX = "complex"  # Requires tools, file writing, or multiple steps
+    SIMPLE = "simple"    # Can be answered directly with general knowledge — no tools needed
+    MEDIUM = "medium"    # Requires tool use but is a single focused task → ReactAgent
+    COMPLEX = "complex"  # Requires planning, file writing, or multiple distinct steps → Orchestrator
 
 
 class SubTask(BaseModel):
