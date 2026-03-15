@@ -11,6 +11,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from agent.context import ReactContextBuilder
 from agent.events import EventLogger, EventType
 from agent.multi_agent import SubTask, TaskResult
 from agent.plan import Action, ActionType
@@ -25,85 +26,6 @@ from tools.runtime import (
     ToolNotAllowedError,
     ToolsRuntimeError,
 )
-
-
-# ── System prompt templates ──────────────────────────────────────────────────
-
-_REACT_SYSTEM_HEADER = """\
-You are an executor agent. Your ONLY job is to complete this ONE task:
-
-OVERALL GOAL: {goal}
-
-TASK: {task_description}
-{context_section}
-
-CRITICAL: Every reply MUST be a single valid JSON object — no prose, no markdown.
-
-## JSON format
-{{"type": "<type>", "params": {{<params>}}}}
-
----
-
-## 1. Work tools  (use these to gather information and make changes)
-{tools_section}
-
-## 2. Termination  (call exactly once when done — do NOT use as a tool)
-- "final_answer": {{"content": "<concise result summary or FAILED: <reason>"}}
-
----
-
-## Rules
-- Use work tools to make progress; call final_answer only when the task is complete or definitively blocked.
-- Do NOT plan, reflect, or narrate — just act.
-- Output ONLY the JSON object — no extra keys, no null-valued keys.
-"""
-
-_TOOL_DECLARATIONS: dict[str, str] = {
-    # "load_skill":    '- "load_skill":    {{"skill_name": "<name>"}}',
-    # "load_resource": '- "load_resource": {{"skill_name": "<name>", "resource": "<filename>"}}',
-    # "run_script":    '- "run_script":    {{"skill_name": "<name>", "script": "<path>", "args": []}}',
-    "read_file":     '- "read_file":     {{"path": "<path>", "max_bytes": 100000}}',
-    "list_dir":      '- "list_dir":      {{"path": "<directory>", "max_entries": 100}}',
-    "grep":          '- "grep":          {{"pattern": "<regex>", "path": "<directory or file>", "max_results": 50}}',
-    "write_file":    '- "write_file":    {{"path": "<path>", "content": "<full file content>"}}  [requires approval]',
-    "delete_file":   '- "delete_file":   {{"path": "<path>"}}  [requires approval]',
-    "web_search":    '- "web_search":    {{"query": "<search query>", "max_results": 5}}',
-}
-
-_TOOL_SECTIONS: list[tuple[str, list[str]]] = [
-    # ("### Skill actions  (load a skill before running its scripts)",
-    #  ["load_skill", "load_resource", "run_script"]),
-    ("### Read tools  (inspect files and search)",
-     ["read_file", "list_dir", "grep"]),
-    ("### Write tools  (modify filesystem, require approval)",
-     ["write_file", "delete_file"]),
-    ("### Web",
-     ["web_search"]),
-]
-
-
-def _build_tools_section(available_tools: list[str]) -> str:
-    always_available = {"load_skill", "load_resource"}
-    effective = set(available_tools) | always_available
-    lines: list[str] = []
-    for header, tools in _TOOL_SECTIONS:
-        section_lines = [_TOOL_DECLARATIONS[t] for t in tools if t in effective]
-        if section_lines:
-            lines.append(header)
-            lines.extend(section_lines)
-    return "\n".join(lines)
-
-
-def _build_system_prompt(task: SubTask, available_tools: list[str]) -> str:
-    context_section = ""
-    if task.context:
-        context_section = f"\nBACKGROUND (completed steps):\n{task.context}\n"
-    return _REACT_SYSTEM_HEADER.format(
-        task_description=task.description,
-        context_section=context_section,
-        goal=task.goal or task.description,
-        tools_section=_build_tools_section(available_tools),
-    )
 
 
 # ── State ────────────────────────────────────────────────────────────────────
@@ -144,7 +66,8 @@ class ReactAgent:
         sink: OutputSink = None,
         max_turns: int = 10,
         dead_loop_window: int = 4,
-        max_context_tokens: int = 80_000,
+        max_context_tokens: int = 100_000,
+        context_builder: Optional[ReactContextBuilder] = None,
     ):
         self._model = model
         self._registry = registry
@@ -154,17 +77,20 @@ class ReactAgent:
         self._sink = sink or NullSink()
         self._max_turns = max_turns
         self._dead_loop_window = dead_loop_window
+        self._ctx_builder = context_builder or ReactContextBuilder(
+            max_context_tokens=max_context_tokens
+        )
 
     def run(self, task: SubTask) -> TaskResult:
         """
         Execute a single atomic SubTask. Returns TaskResult (never raises).
         """
         available_tools = self._tools.available_tools() if self._tools is not None else []
-        system_prompt = _build_system_prompt(task, available_tools)
 
         # Build response format restricted to action types actually shown in the prompt
-        declared_in_prompt = {t for _, tools in _TOOL_SECTIONS for t in tools}
-        schema_action_types = list((set(available_tools) & declared_in_prompt) | {"final_answer"})
+        schema_action_types = list(
+            (set(available_tools) & ReactContextBuilder.DECLARED_TOOLS) | {"final_answer"}
+        )
         react_format = build_action_response_format(schema_action_types)
 
         state = ReactState(
@@ -182,7 +108,7 @@ class ReactAgent:
         while not state.is_done() and state.turn_count < self._max_turns:
             state.turn_count += 1
 
-            messages = self._build_messages(system_prompt, task, react_history)
+            messages = self._ctx_builder.build(task, react_history, available_tools)
             self._sink.on_thinking_start(state.turn_count)
 
             try:
@@ -242,29 +168,6 @@ class ReactAgent:
             "success": final_result.success,
         })
         return final_result
-
-    # ── Context assembly ──────────────────────────────────────────────────────
-
-    def _build_messages(
-        self,
-        system_prompt: str,
-        task: SubTask,
-        react_history: list[tuple[Action, str]],
-    ) -> list[dict]:
-        msgs: list[dict] = [
-            {"role": "system", "content": system_prompt},
-            # {"role": "user", "content": task.description},
-        ]
-        for action, observation in react_history:
-            if isinstance(action, Action):
-                action_content = json.dumps(
-                    {"type": action.type, "params": action.params}, ensure_ascii=False
-                )
-            else:
-                action_content = json.dumps(action, ensure_ascii=False)
-            msgs.append({"role": "assistant", "content": action_content})
-            msgs.append({"role": "user", "content": f"Observation: {observation}"})
-        return msgs
 
     # ── Action dispatch ───────────────────────────────────────────────────────
 

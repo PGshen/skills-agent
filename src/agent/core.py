@@ -3,7 +3,11 @@
 from pathlib import Path
 from typing import Optional
 
-from agent.context import _plan_summary as _format_plan_summary  # noqa: F401 — re-export for tests
+from agent.context import (
+    ClassifyContextBuilder,
+    OrchestratorContextBuilder,
+    _plan_summary as _format_plan_summary,  # noqa: F401 — re-export for tests
+)
 from agent.events import EventLogger, EventType
 from agent.multi_agent import SubTask, TaskComplexity
 from agent.orchestrator import OrchestratorAgent, OrchestratorState
@@ -14,23 +18,6 @@ from model.base import ModelAdapter, ModelResponseError
 from output.sink import NullSink, OutputSink
 from skills.loader import SkillLoader
 from skills.registry import SkillRegistry
-
-
-_CLASSIFY_PROMPT = """\
-Classify the following user request as "simple" or "complex".
-
-simple: Can be answered immediately with general knowledge — no tools, no file writing needed.
-  Examples: "What is quicksort?", "Translate this sentence", "Explain this error message"
-
-complex: Requires writing files, running code, web search, or involves multiple steps.
-  Examples: "Write a quicksort script and save it", "Search X and summarize", "Build Y feature"
-
-Output a single JSON object only:
-{{"type": "final_answer", "params": {{"content": "simple"}}}}
-or
-{{"type": "final_answer", "params": {{"content": "complex"}}}}
-
-User request: {user_input}"""
 
 
 class AgentCore:
@@ -111,7 +98,7 @@ class AgentCore:
         orch_state = self._restore_orchestrator_state(initial_state)
 
         # Classify
-        complexity = self._classify(user_input, history_messages)
+        complexity = self._classify(user_input)
         self._sink.on_route_decision(complexity.value)
         self._logger.emit(EventType.ROUTE_DECISION, {
             "complexity": complexity.value,
@@ -129,12 +116,9 @@ class AgentCore:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _classify(self, user_input: str, history_messages: list[dict]) -> TaskComplexity:
+    def _classify(self, user_input: str) -> TaskComplexity:
         """One model call to classify task complexity. Defaults to COMPLEX on any failure."""
-        messages = list(history_messages) + [{
-            "role": "user",
-            "content": _CLASSIFY_PROMPT.format(user_input=user_input),
-        }]
+        messages = ClassifyContextBuilder().build(user_input)
         self._sink.on_thinking_start(0, "Classifying…")
         try:
             action = self._model.next_action(messages)
@@ -148,14 +132,10 @@ class AgentCore:
 
     def _run_simple(self, user_input: str, history_messages: list[dict]) -> str:
         """Run a simple task through the ReactAgent (single-step, no planning)."""
-        context = ""
-        if history_messages:
-            lines = [
-                f"{m['role']}: {m['content']}"
-                for m in history_messages
-                if m.get("role") in ("user", "assistant")
-            ]
-            context = "\n".join(lines)
+        context = OrchestratorContextBuilder().build_subtask_context(
+            prior_results=[],
+            history_messages=history_messages,
+        )
         task = SubTask(
             step_id="simple-0",
             description=user_input,

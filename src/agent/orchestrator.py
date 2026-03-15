@@ -6,15 +6,15 @@ Responsibilities:
   3. Synthesize: one model call → final answer from all step results
 """
 
-import json
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from agent.context import OrchestratorContextBuilder
 from agent.events import EventLogger, EventType
 from agent.multi_agent import SubTask, TaskResult
-from agent.plan import Action, ActionType, Plan, Step, StepStatus
+from agent.plan import ActionType, Plan, Step, StepStatus
 from agent.react_agent import ReactAgent
 from model.base import ModelAdapter, ModelResponseError
 from model.openai import build_action_response_format
@@ -25,48 +25,6 @@ from skills.registry import SkillRegistry
 # Response format schemas for each orchestrator phase
 _DECOMPOSE_FORMAT = build_action_response_format(["update_plan"])
 _SYNTHESIZE_FORMAT = build_action_response_format(["final_answer"])
-
-
-# ── Prompt templates ─────────────────────────────────────────────────────────
-
-_DECOMPOSE_PROMPT = """\
-You are a task planner. Break the user's request into a small number of meaningful, high-level steps.
-
-Guidelines:
-- Aim for 2–4 steps; only use more if the task genuinely requires distinct phases
-- Each step should represent a coherent chunk of work, not a single line of code or one command
-- Group closely related actions together (e.g., "implement X and write tests for it" is one step, not two)
-- Simple, self-contained tasks (write a function, answer a question) need only 1 step
-- Steps must be executable in sequence by a separate agent
-
-Output a single JSON object (no prose, no markdown):
-{{
-  "type": "update_plan",
-  "params": {{
-    "plan": {{
-      "goal": "<restate the user's goal concisely>",
-      "steps": [
-        {{"id": "1", "description": "<meaningful step>", "status": "pending"}},
-        {{"id": "2", "description": "<meaningful step>", "status": "pending"}}
-      ]
-    }}
-  }}
-}}
-
-User request: {user_input}"""
-
-_SYNTHESIZE_PROMPT = """\
-You are a result synthesizer. Given the user's original request and the results
-of each completed step, write a comprehensive final answer for the user.
-
-User request: {user_input}
-
-Step results:
-{step_results}
-
-Write a clear, complete response. Include relevant outputs, file paths, or summaries.
-Output a single JSON object:
-{{"type": "final_answer", "params": {{"content": "<your complete answer>"}}}}"""
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -105,6 +63,7 @@ class OrchestratorAgent:
         dead_loop_window: int = 4,
         max_context_tokens: int = 80_000,
         run_dir: Optional[Path] = None,
+        context_builder: Optional[OrchestratorContextBuilder] = None,
     ):
         self._model = model
         self._registry = registry
@@ -116,6 +75,7 @@ class OrchestratorAgent:
         self._dead_loop_window = dead_loop_window
         self._max_context_tokens = max_context_tokens
         self._run_dir = run_dir
+        self._ctx_builder = context_builder or OrchestratorContextBuilder()
 
     def run(
         self,
@@ -165,7 +125,10 @@ class OrchestratorAgent:
                 "description": step.description,
             })
 
-            context = self._build_step_context(state.results)
+            context = self._ctx_builder.build_subtask_context(
+                prior_results=state.results,
+                history_messages=history_messages,
+            )
             subtask = SubTask(
                 step_id=step.id,
                 description=step.description,
@@ -203,10 +166,7 @@ class OrchestratorAgent:
 
     def _decompose(self, user_input: str, history_messages: list[dict]) -> Plan:
         """Call model once to produce a Plan. Falls back to a single-step plan on failure."""
-        prompt = _DECOMPOSE_PROMPT.format(user_input=user_input)
-        messages = list(history_messages) + [
-            {"role": "user", "content": prompt},
-        ]
+        messages = self._ctx_builder.build_decompose(user_input, history_messages)
         self._sink.on_thinking_start(0, "Planning…")
         try:
             action = self._model.next_action(messages, response_format=_DECOMPOSE_FORMAT)
@@ -228,14 +188,7 @@ class OrchestratorAgent:
         history_messages: list[dict],
     ) -> str:
         """Call model once to synthesize a final answer from all step results."""
-        step_results = self._format_results(results)
-        prompt = _SYNTHESIZE_PROMPT.format(
-            user_input=user_input,
-            step_results=step_results,
-        )
-        messages = list(history_messages) + [
-            {"role": "user", "content": prompt},
-        ]
+        messages = self._ctx_builder.build_synthesize(user_input, results, history_messages)
         self._sink.on_thinking_start(0, "Synthesizing…")
         try:
             if hasattr(self._model, "next_action_streaming"):
@@ -259,27 +212,6 @@ class OrchestratorAgent:
         )
         self._sink.on_text_chunk(fallback, done=True)
         return fallback
-
-    def _build_step_context(self, results: list[TaskResult]) -> str:
-        if not results:
-            return ""
-        lines = ["Completed steps so far:"]
-        for r in results:
-            status = "✓" if r.success else "✗"
-            # lines.append(f"  [{status}] Step {r.step_id}: {r.output[:200]}")
-            lines.append(f"  [{status}] Step {r.step_id}: {r.output}")
-        return "\n".join(lines)
-
-    def _format_results(self, results: list[TaskResult]) -> str:
-        if not results:
-            return "(no steps completed)"
-        lines = []
-        for r in results:
-            status = "SUCCESS" if r.success else "FAILED"
-            lines.append(f"Step {r.step_id} [{status}]: {r.output}")
-            if r.artifacts:
-                lines.append(f"  Artifacts: {', '.join(r.artifacts)}")
-        return "\n".join(lines)
 
     def _make_react_agent(self) -> ReactAgent:
         return ReactAgent(

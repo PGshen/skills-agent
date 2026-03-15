@@ -306,7 +306,8 @@ class TestSinkCallbacks:
 # ---------------------------------------------------------------------------
 
 class TestHistoryMessages:
-    def test_history_messages_appear_in_classify_call(self, tmp_path):
+    def test_classify_call_does_not_include_history(self, tmp_path):
+        """Classification is stateless by design — history is not injected."""
         history = [
             {"role": "user", "content": "prior question"},
             {"role": "assistant", "content": "prior answer"},
@@ -314,10 +315,12 @@ class TestHistoryMessages:
         model = MockModel([classify_simple(), final_answer("answer")])
         core = make_core(model, tmp_path)
         core.run("new question", history_messages=history)
-        # The classify call includes history_messages
+        # The classify call is a single user message (no history injected)
         classify_msgs = model.call_history[0]
+        assert len(classify_msgs) == 1
+        assert classify_msgs[0]["role"] == "user"
         contents = [m["content"] for m in classify_msgs]
-        assert any("prior question" in c for c in contents)
+        assert not any("prior question" in c for c in contents)
 
 
 # ---------------------------------------------------------------------------
