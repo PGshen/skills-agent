@@ -51,10 +51,11 @@ class OutputSink:
         recoverable: True 表示 Agent 将继续尝试（如重试），False 表示致命错误
         """
 
-    def on_thinking_start(self, turn: int) -> None:
+    def on_thinking_start(self, turn: int, label: str = "Thinking…") -> None:
         """
         模型开始推理（调用 model.next_action 之前）。
-        turn: 当前轮次编号（从 1 开始）
+        turn: 当前轮次编号（从 1 开始，0 表示非循环调用如 classify/decompose）
+        label: 显示标签，如 "Thinking…"、"Planning…"、"Synthesizing…"
         用于显示 loading 状态（如 spinner）。
         """
 
@@ -62,6 +63,29 @@ class OutputSink:
         """
         会话/任务结束通知。
         status: "completed" / "failed" / "dead_loop" / "max_turns"
+        """
+
+    # ── Multi-agent hooks (Phase 2+) ──────────────────────────────────────────
+
+    def on_route_decision(self, complexity: str) -> None:
+        """
+        EntryAgent 路由决策通知。
+        complexity: "simple" | "complex"
+        """
+
+    def on_subtask_start(self, step_id: str, description: str) -> None:
+        """
+        OrchestratorAgent 开始派发一个子任务给 ReactAgent。
+        step_id: 步骤 ID，如 "1", "2"
+        description: 步骤描述
+        """
+
+    def on_subtask_done(self, step_id: str, success: bool, summary: str) -> None:
+        """
+        ReactAgent 完成（或失败）一个子任务后回调。
+        step_id: 步骤 ID
+        success: True 表示成功，False 表示失败
+        summary: 结果摘要（截断后的 output 文本）
         """
 
 

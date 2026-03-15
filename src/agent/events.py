@@ -21,6 +21,10 @@ class EventType(str, Enum):
     ERROR = "error"
     MODEL_REQUEST = "model_request"
     MODEL_RESPONSE = "model_response"
+    # Multi-agent events
+    ROUTE_DECISION = "route_decision"   # EntryAgent classified the task
+    SUBTASK_START = "subtask_start"     # OrchestratorAgent dispatched a step
+    SUBTASK_DONE = "subtask_done"       # ReactAgent returned a result
 
 
 class Event(BaseModel):

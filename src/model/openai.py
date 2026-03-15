@@ -12,90 +12,118 @@ from output.sink import NullSink, OutputSink
 from .base import ModelAdapter, parse_action_response
 from .streaming import StreamingJSONParser
 
-# Strict JSON Schema for the Action response.
-# Forces the model to always return {"type": "<enum>", "params": {...}}.
-# All params fields are nullable so strict mode can require them all.
-_ACTION_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "agent_action",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": [
-                        "load_skill",
-                        "load_resource",
-                        "run_script",
-                        "update_plan",
-                        "final_answer",
-                    ],
-                },
-                "params": {
-                    "type": "object",
-                    "properties": {
-                        "skill_name":   {"type": ["string", "null"]},
-                        "resource":     {"type": ["string", "null"]},
-                        "section_hint": {"type": ["string", "null"]},
-                        "script":       {"type": ["string", "null"]},
-                        "args": {
-                            "anyOf": [
-                                {"type": "null"},
-                                {"type": "array", "items": {"type": "string"}},
-                            ]
-                        },
-                        "content": {"type": ["string", "null"]},
-                        "plan": {
-                            "anyOf": [
-                                {"type": "null"},
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "goal": {"type": "string"},
-                                        "steps": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "id":          {"type": "string"},
-                                                    "description": {"type": "string"},
-                                                    "status": {
-                                                        "type": "string",
-                                                        "enum": ["pending", "in_progress", "done", "failed"],
-                                                    },
-                                                    "notes": {"type": ["string", "null"]},
-                                                },
-                                                "required": ["id", "description", "status", "notes"],
-                                                "additionalProperties": False,
-                                            },
-                                        },
-                                    },
-                                    "required": ["goal", "steps"],
-                                    "additionalProperties": False,
-                                },
-                            ]
-                        },
+
+# ── Per-action param field definitions ───────────────────────────────────────
+
+_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "goal": {"type": "string"},
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id":          {"type": "string"},
+                    "description": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "done", "failed"],
                     },
-                    "required": [
-                        "skill_name", "resource", "section_hint",
-                        "script", "args", "content", "plan",
-                    ],
-                    "additionalProperties": False,
+                    "notes": {"type": ["string", "null"]},
                 },
+                "required": ["id", "description", "status", "notes"],
+                "additionalProperties": False,
             },
-            "required": ["type", "params"],
-            "additionalProperties": False,
         },
     },
+    "required": ["goal", "steps"],
+    "additionalProperties": False,
 }
+
+_PARAM_SCHEMAS: dict[str, dict] = {
+    "skill_name":   {"type": ["string", "null"]},
+    "resource":     {"type": ["string", "null"]},
+    "section_hint": {"type": ["string", "null"]},
+    "script":       {"type": ["string", "null"]},
+    "args":         {"anyOf": [{"type": "null"}, {"type": "array", "items": {"type": "string"}}]},
+    "content":      {"type": ["string", "null"]},
+    "plan":         {"anyOf": [{"type": "null"}, _PLAN_SCHEMA]},
+    "path":         {"type": ["string", "null"]},
+    "max_bytes":    {"type": ["integer", "null"]},
+    "max_entries":  {"type": ["integer", "null"]},
+    "pattern":      {"type": ["string", "null"]},
+    "max_results":  {"type": ["integer", "null"]},
+    "query":        {"type": ["string", "null"]},
+}
+
+# Params needed by each action type
+_ACTION_PARAMS: dict[str, list[str]] = {
+    "load_skill":    ["skill_name"],
+    "load_resource": ["skill_name", "resource", "section_hint"],
+    "run_script":    ["skill_name", "script", "args"],
+    "update_plan":   ["plan"],
+    "final_answer":  ["content"],
+    "read_file":     ["path", "max_bytes"],
+    "list_dir":      ["path", "max_entries"],
+    "grep":          ["pattern", "path", "max_results"],
+    "write_file":    ["path", "content"],
+    "delete_file":   ["path"],
+    "web_search":    ["query", "max_results"],
+}
+
+
+def build_action_response_format(action_types: list[str]) -> dict:
+    """
+    Build an OpenAI structured-output response_format for the given action types.
+
+    Only the action types listed are allowed in the 'type' enum.
+    Only the param fields needed by those action types are included in the schema.
+    All included param fields are nullable so OpenAI strict mode can require them all.
+    """
+    # Union of param fields needed by all requested action types
+    needed_params: set[str] = set()
+    for at in action_types:
+        needed_params.update(_ACTION_PARAMS.get(at, []))
+
+    param_properties = {k: _PARAM_SCHEMAS[k] for k in needed_params if k in _PARAM_SCHEMAS}
+    param_required = sorted(param_properties)  # stable order; all nullable so always safe
+
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "agent_action",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": action_types,
+                    },
+                    "params": {
+                        "type": "object",
+                        "properties": param_properties,
+                        "required": param_required,
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["type", "params"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 class OpenAIAdapter(ModelAdapter):
     """
     OpenAI API adapter (Phase C).
     Supports non-streaming and streaming call modes.
+
+    response_format: default structured-output schema passed to every call.
+    Callers can override per-call by passing response_format to next_action /
+    next_action_streaming.  Use build_action_response_format() to build schemas
+    tailored to the action types actually needed.
     """
 
     def __init__(
@@ -104,35 +132,43 @@ class OpenAIAdapter(ModelAdapter):
         model: str = "gpt-4o",
         max_tokens: int = 4096,
         sink: OutputSink = None,      # streaming answer chunk callback
+        response_format: dict = None,
     ):
         self._client = OpenAI(api_key=api_key)
         self._model = model
         self._max_tokens = max_tokens
         self._sink = sink or NullSink()
+        self._default_response_format = response_format
 
-    def next_action(self, messages: list[dict]) -> Action:
+    def next_action(self, messages: list[dict], response_format: dict = None) -> Action:
         """Non-streaming call. AgentCore._execute_action() emits the text chunk."""
+        fmt = response_format or self._default_response_format
         logger.debug(
             "request model=%s messages=%s",
             self._model,
             json.dumps(messages, ensure_ascii=False),
         )
+        kwargs = {}
+        if fmt is not None:
+            kwargs["response_format"] = fmt
         response = self._client.chat.completions.create(
             model=self._model,
             max_tokens=self._max_tokens,
             messages=messages,
-            response_format=_ACTION_RESPONSE_FORMAT,
+            **kwargs,
         )
         raw = response.choices[0].message.content
         logger.debug("response model=%s raw=%s", self._model, raw)
         return parse_action_response(raw)
 
-    def next_action_streaming(self, messages: list[dict]) -> Action:
+    def next_action_streaming(self, messages: list[dict], response_format: dict = None) -> Action:
         """
         Streaming call (Phase C full version).
         Parses tokens in real time via StreamingJSONParser,
         calling sink.on_text_chunk() character-by-character on $.params.content.
         """
+        fmt = response_format or self._default_response_format
+
         def on_answer_chunk(_path: str, value: str, done: bool) -> None:
             # Send "" when done=True — content was already emitted char-by-char via
             # done=False deltas; passing the full value here would cause CLISink to
@@ -148,12 +184,15 @@ class OpenAIAdapter(ModelAdapter):
             self._model,
             json.dumps(messages, ensure_ascii=False),
         )
+        kwargs = {}
+        if fmt is not None:
+            kwargs["response_format"] = fmt
         stream = self._client.chat.completions.create(
             model=self._model,
             max_tokens=self._max_tokens,
             messages=messages,
             stream=True,
-            response_format=_ACTION_RESPONSE_FORMAT,
+            **kwargs,
         )
         raw_chunks: list[str] = []
         for chunk in stream:

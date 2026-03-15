@@ -24,7 +24,7 @@ class MockModel(ModelAdapter):
         self._index = 0
         self._call_history: list[list[dict]] = []
 
-    def next_action(self, messages: list[dict]) -> Action:
+    def next_action(self, messages: list[dict], response_format: dict = None) -> Action:
         self._call_history.append(messages)
 
         if self._index >= len(self._actions):

@@ -17,11 +17,14 @@ class ModelAdapter(ABC):
     """
 
     @abstractmethod
-    def next_action(self, messages: list[dict]) -> Action:
+    def next_action(self, messages: list[dict], response_format: dict = None) -> Action:
         """
         向模型发送 messages，解析并返回单个 Action。
         messages 格式：OpenAI 风格 [{"role": str, "content": str}, ...]
         失败时抛出 ModelResponseError。
+
+        response_format: 可选的结构化输出 schema（如 OpenAI JSON schema format）。
+        不支持该参数的实现可忽略它。
         """
 
     def close(self) -> None:

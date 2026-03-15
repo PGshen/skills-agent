@@ -27,9 +27,15 @@ _STEP_ICON = {
 
 # 动作类型显示样式: (颜色, 显示标签)
 _ACTION_STYLES: dict[str, tuple[str, str]] = {
-    "load_skill":     (_CYAN,   "Load Skill"),
-    "load_resource":  (_BLUE,   "Load Resource"),
-    "run_script":     (_GREEN,  "Run Script"),
+    "load_skill":        (_CYAN,   "Load Skill"),
+    "load_resource":     (_BLUE,   "Load Resource"),
+    "run_script":        (_GREEN,  "Run Script"),
+    "read_file":         (_BLUE,   "Read File"),
+    "list_dir":          (_BLUE,   "List Dir"),
+    "grep":              (_BLUE,   "Grep"),
+    "web_search":        (_CYAN,   "Web Search"),
+    "write_file":        (_YELLOW, "Write File"),
+    "delete_file":       (_RED,    "Delete File"),
 }
 
 
@@ -47,6 +53,7 @@ class CLISink(OutputSink):
         self._verbose = verbose
         self._color = color and sys.stderr.isatty()
         self._answer_started = False
+        self._last_char = ""
         self._max_obs_lines = max_obs_lines
         # Spinner state
         self._spinner_stop = threading.Event()
@@ -73,12 +80,12 @@ class CLISink(OutputSink):
             sys.stderr.write("\r\033[K")
             sys.stderr.flush()
 
-    def on_thinking_start(self, turn: int) -> None:
+    def on_thinking_start(self, turn: int, label: str = "Thinking…") -> None:
         """模型推理开始：显示 spinner。"""
         if not self._color:
             return
         self._clear_spinner()
-        label = f"Thinking… (turn {turn})"
+        label = f"{label} (turn {turn})" if turn > 0 else label
         self._spinner_stop.clear()
         self._spinner_active = True
 
@@ -146,6 +153,24 @@ class CLISink(OutputSink):
             file=sys.stderr,
         )
 
+    def on_route_decision(self, complexity: str) -> None:
+        self._clear_spinner()
+        icon = "◎" if complexity == "complex" else "◉"
+        print(self._fmt(_DIM, f"  {icon} Route: {complexity}"), file=sys.stderr)
+
+    def on_subtask_start(self, step_id: str, description: str) -> None:
+        self._clear_spinner()
+        print(
+            self._fmt(_CYAN, f"\n  → Step {step_id}: {description}"),
+            file=sys.stderr,
+        )
+
+    def on_subtask_done(self, step_id: str, success: bool, summary: str) -> None:
+        self._clear_spinner()
+        icon = "✓" if success else "✗"
+        color = _GREEN if success else _RED
+        print(self._fmt(color, f"  {icon} Step {step_id} done"), file=sys.stderr)
+
     # ── 最终答案（→ stdout）────────────────────────────────────────────
 
     def on_text_chunk(self, chunk: str, done: bool) -> None:
@@ -155,11 +180,14 @@ class CLISink(OutputSink):
             print(file=sys.stderr, flush=True)
             self._answer_started = True
 
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
+        if chunk:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            self._last_char = chunk[-1]
 
         if done:
-            if chunk and not chunk.endswith("\n"):
+            if self._answer_started and self._last_char != "\n":
                 sys.stdout.write("\n")
                 sys.stdout.flush()
             self._answer_started = False
+            self._last_char = ""

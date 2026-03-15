@@ -47,14 +47,17 @@ class ApprovalManager:
             return False
 
         # Prompt the user
+        _RESET = "\033[0m"
+        _BOLD = "\033[1m"
+        _risk_color = {"high": "\033[91m", "medium": "\033[93m", "low": "\033[92m"}.get(req.risk, "\033[93m")
         print(
-            f"\n[Approval Required]\n"
-            f"  Tool:   {req.tool}\n"
-            f"  Risk:   {req.risk}\n"
-            f"  Skill:  {req.skill_name}\n"
-            f"  Params: {req.params}"
+            f"\n{_BOLD}\033[33m[Approval Required]{_RESET}\n"
+            f"  Tool:   {_BOLD}{req.tool}{_RESET}\n"
+            f"  Risk:   {_risk_color}{_BOLD}{req.risk}{_RESET}\n"
+            # f"  Skill:  {req.skill_name}\n"
+            # f"  Params: {req.params}"
         )
-        answer = input("Allow? [y/N/run (allow for this run)] ").strip().lower()
+        answer = input(f"{_BOLD}Allow?{_RESET} [y/N/run (allow for this run)] ").strip().lower()
 
         if answer == "y":
             return True

@@ -183,9 +183,19 @@ class TestBuildResumeContext:
 
 class TestAgentCorePersistence:
     def test_state_json_written_after_plan_update(self, tmp_path: Path):
+        """
+        OrchestratorAgent writes state.json (AgentState-compatible) after each step
+        so that cli/run.py --resume and load_state() continue to work.
+
+        Multi-agent protocol:
+          1. classify  → "complex"
+          2. decompose → UPDATE_PLAN (goal="test goal")
+          3. ReactAgent step 1 → FINAL_ANSWER "step done"
+          4. synthesize → FINAL_ANSWER "all done"
+        """
         from agent.core import AgentCore
         from agent.events import EventLogger
-        from agent.plan import ActionType
+        from agent.plan import Action, ActionType
         from model.mock import MockModel
         from skills.loader import SkillLoader
         from skills.registry import SkillRegistry
@@ -200,16 +210,17 @@ class TestAgentCorePersistence:
         loader = SkillLoader()
 
         actions = [
-            {
-                "type": "update_plan",
-                "params": {
-                    "plan": {
-                        "goal": "test goal",
-                        "steps": [{"id": "s1", "description": "step one"}],
-                    }
-                },
-            },
-            {"type": "final_answer", "params": {"content": "done"}},
+            # 1. classify → complex
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "complex"}),
+            # 2. decompose → plan
+            Action(type=ActionType.UPDATE_PLAN, params={"plan": {
+                "goal": "test goal",
+                "steps": [{"id": "s1", "description": "step one", "status": "pending"}],
+            }}),
+            # 3. ReactAgent step 1
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "step done"}),
+            # 4. synthesize
+            Action(type=ActionType.FINAL_ANSWER, params={"content": "all done"}),
         ]
         model = MockModel(actions=actions)
         core = AgentCore(

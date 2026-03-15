@@ -1,41 +1,59 @@
-"""AgentCore: ReAct main loop."""
+"""AgentCore: EntryAgent — classifies task complexity and routes to the right agent."""
 
-import hashlib
-import json
 from pathlib import Path
 from typing import Optional
 
-from agent.context import ContextBuilder, _plan_summary as _format_plan_summary
+from agent.context import _plan_summary as _format_plan_summary  # noqa: F401 — re-export for tests
 from agent.events import EventLogger, EventType
-from agent.plan import Action, ActionType, Plan
-from agent.recovery import save_state
+from agent.multi_agent import SubTask, TaskComplexity
+from agent.orchestrator import OrchestratorAgent, OrchestratorState
+from agent.plan import ActionType
+from agent.react_agent import ReactAgent
 from agent.state import AgentState
 from model.base import ModelAdapter, ModelResponseError
 from output.sink import NullSink, OutputSink
-from skills.loader import PathTraversalError, SkillLoader
-from skills.metadata import SkillMetadata
+from skills.loader import SkillLoader
 from skills.registry import SkillRegistry
-from tools.runtime import (
-    ApprovalDeniedError,
-    ToolNotAllowedError,
-    ToolsRuntimeError,
-)
+
+
+_CLASSIFY_PROMPT = """\
+Classify the following user request as "simple" or "complex".
+
+simple: Can be answered immediately with general knowledge — no tools, no file writing needed.
+  Examples: "What is quicksort?", "Translate this sentence", "Explain this error message"
+
+complex: Requires writing files, running code, web search, or involves multiple steps.
+  Examples: "Write a quicksort script and save it", "Search X and summarize", "Build Y feature"
+
+Output a single JSON object only:
+{{"type": "final_answer", "params": {{"content": "simple"}}}}
+or
+{{"type": "final_answer", "params": {{"content": "complex"}}}}
+
+User request: {user_input}"""
 
 
 class AgentCore:
+    """
+    Entry agent: classifies task complexity, then either answers directly (simple)
+    or delegates to OrchestratorAgent (complex).
+
+    Public interface is identical to the old AgentCore so CLI code needs no changes.
+    """
+
     def __init__(
         self,
         model: ModelAdapter,
         registry: SkillRegistry,
         loader: SkillLoader,
         event_logger: EventLogger,
-        tools=None,                      # Phase B: ToolsRuntime
+        tools=None,
         sink: OutputSink = None,
         max_turns: int = 20,
-        dead_loop_window: int = 6,       # action hash detection window size
-        dead_loop_stall_turns: int = 4,  # Phase B: plan stall warning threshold
+        dead_loop_window: int = 6,
+        dead_loop_stall_turns: int = 4,   # kept for API compatibility, unused
         max_context_tokens: int = 100_000,
-        run_dir: Optional[Path] = None,  # B4.1: persistence directory
+        run_dir: Optional[Path] = None,
     ):
         self._model = model
         self._registry = registry
@@ -45,9 +63,33 @@ class AgentCore:
         self._sink = sink or NullSink()
         self._max_turns = max_turns
         self._dead_loop_window = dead_loop_window
-        self._dead_loop_stall_turns = dead_loop_stall_turns
-        self._context_builder = ContextBuilder(max_context_tokens=max_context_tokens)
+        self._max_context_tokens = max_context_tokens
         self._run_dir = run_dir
+
+        self._orchestrator = OrchestratorAgent(
+            model=model,
+            registry=registry,
+            loader=loader,
+            event_logger=event_logger,
+            tools=tools,
+            sink=self._sink,
+            max_turns_per_subtask=max(1, max_turns // 2),
+            dead_loop_window=dead_loop_window,
+            max_context_tokens=max_context_tokens,
+            run_dir=run_dir,
+        )
+
+        self._react_agent = ReactAgent(
+            model=model,
+            registry=registry,
+            loader=loader,
+            event_logger=event_logger,
+            tools=tools,
+            sink=self._sink,
+            max_turns=5,
+            dead_loop_window=dead_loop_window,
+            max_context_tokens=max_context_tokens,
+        )
 
     def run(
         self,
@@ -56,497 +98,84 @@ class AgentCore:
         initial_state: Optional[AgentState] = None,
     ) -> str:
         """
-        Execute full ReAct loop, return final answer string.
+        Classify the request, then route:
+          simple  → one model call for a direct answer
+          complex → OrchestratorAgent (plan → execute → synthesize)
 
-        history_messages: built by SessionContext.build_history_messages() in chat mode,
-            or by build_resume_context() for crash recovery (B4.1).
-        initial_state: restored AgentState for crash recovery; if None, a fresh state is created.
-        Single-shot mode (run command): omit both or pass None (treated as []).
+        history_messages: cross-task session history (chat mode)
+        initial_state: restored AgentState for crash recovery (B4.1 compatibility)
         """
-        if history_messages is None:
-            history_messages = []
+        history_messages = history_messages or []
 
-        # Initialization
-        skill_metas = self._registry.scan()
-        if initial_state is not None:
-            state = initial_state
-            state.user_input = user_input
-        else:
-            state = AgentState(
-                session_id=self._logger.session_id,
-                user_input=user_input,
-            )
-        self._logger.emit(EventType.SESSION_START, {
+        # Restore OrchestratorState from legacy AgentState if provided
+        orch_state = self._restore_orchestrator_state(initial_state)
+
+        # Classify
+        complexity = self._classify(user_input, history_messages)
+        self._sink.on_route_decision(complexity.value)
+        self._logger.emit(EventType.ROUTE_DECISION, {
+            "complexity": complexity.value,
             "user_input": user_input,
-            "skill_count": len(skill_metas),
         })
 
-        react_history: list[tuple[Action, str]] = []
-        final_answer = ""
+        if complexity == TaskComplexity.SIMPLE:
+            return self._run_simple(user_input, history_messages)
+        else:
+            return self._orchestrator.run(
+                user_input,
+                history_messages=history_messages,
+                initial_state=orch_state,
+            )
 
-        # Turn loop
-        while not state.is_done() and state.turn_count < self._max_turns:
-            state.turn_count += 1
+    # ── Private helpers ───────────────────────────────────────────────────────
 
-            # Detect update_plan stall: N consecutive update_plan with no real work
-            stall_injection = None
-            if len(react_history) >= self._dead_loop_stall_turns:
-                recent = react_history[-self._dead_loop_stall_turns:]
-                if all(
-                    isinstance(a, Action) and a.type == ActionType.UPDATE_PLAN
-                    for a, _ in recent
-                ):
-                    stall_injection = (
-                        f"Error: you have called update_plan {self._dead_loop_stall_turns} times "
-                        "in a row without doing any real work. "
-                        "Your next action MUST be write_file, run_script, web_search, read_file, "
-                        "or another work tool. Do NOT call update_plan again."
-                    )
-
-            messages = self._build_context(state, history_messages, react_history, stall_injection=stall_injection)
-            self._logger.emit(EventType.MODEL_REQUEST, {
-                "turn": state.turn_count,
-                "message_count": len(messages),
-                "messages": messages,
-            })
-            self._sink.on_thinking_start(state.turn_count)
-            try:
-                if hasattr(self._model, "next_action_streaming"):
-                    action = self._model.next_action_streaming(messages)
-                    streaming = True
-                else:
-                    action = self._model.next_action(messages)
-                    streaming = False
-            except ModelResponseError as exc:
-                self._sink.on_error(f"Model response parse error: {exc}", recoverable=False)
-                self._logger.emit(EventType.ACTION_FAILED, {
-                    "turn": state.turn_count,
-                    "reason": "parse_error",
-                    "detail": str(exc),
-                })
-                break
-
-            self._logger.emit(EventType.MODEL_RESPONSE, {
-                "turn": state.turn_count,
-                "action_type": str(action.type),
-            })
-            self._logger.emit(EventType.ACTION_REQUESTED, {
-                "turn": state.turn_count,
-                "action_type": action.type,
-                "params": action.params,
-            })
-
-            # Dead loop detection (primary mechanism: action hash)
-            if self._check_dead_loop_hash(action, state):
-                state.dead_loop_triggered = True
-                self._sink.on_error("Dead loop detected: repeated action", recoverable=False)
-                self._logger.emit(EventType.DEAD_LOOP_DETECTED, {"reason": "repeated_action"})
-                break
-
-            # Track plan progress before/after action (for Phase B stall detection)
-            old_statuses = {s.id: s.status for s in state.plan.steps} if state.plan else {}
-
-            observation = self._execute_action(action, state, streaming=streaming)
-            observation = self._apply_piggybacked_plan(action, state, observation)
-
-            new_statuses = {s.id: s.status for s in state.plan.steps} if state.plan else {}
-            if old_statuses != new_statuses:
-                state.last_plan_progress_turn = state.turn_count
-
-            self._logger.emit(EventType.ACTION_COMPLETED, {
-                "turn": state.turn_count,
-                "action_type": action.type,
-                "observation": observation[:200],
-            })
-
-            react_history.append((action, observation))
-
+    def _classify(self, user_input: str, history_messages: list[dict]) -> TaskComplexity:
+        """One model call to classify task complexity. Defaults to COMPLEX on any failure."""
+        messages = list(history_messages) + [{
+            "role": "user",
+            "content": _CLASSIFY_PROMPT.format(user_input=user_input),
+        }]
+        self._sink.on_thinking_start(0, "Classifying…")
+        try:
+            action = self._model.next_action(messages)
             if action.type == ActionType.FINAL_ANSWER:
-                final_answer = observation
-                break
+                content = action.params.get("content", "").strip().lower()
+                if "simple" in content:
+                    return TaskComplexity.SIMPLE
+        except (ModelResponseError, Exception):
+            pass
+        return TaskComplexity.COMPLEX  # conservative default
 
-        # Determine final status and notify
-        if state.dead_loop_triggered:
-            final_status = "dead_loop"
-        elif state.status == "completed":
-            final_status = "completed"
-        else:
-            # max_turns exhausted without completion
-            self._sink.on_error("Budget exhausted: max turns reached", recoverable=False)
-            final_status = "max_turns"
-
-        self._logger.emit(EventType.SESSION_END, {
-            "turns": state.turn_count,
-            "status": final_status,
-        })
-        self._sink.on_session_end(state.turn_count, final_status)
-
-        return final_answer
-
-    def _build_context(
-        self,
-        state: AgentState,
-        history_messages: list[dict],
-        react_history: list[tuple[Action, str]],
-        stall_injection: Optional[str] = None,
-    ) -> list[dict]:
-        """Assemble the messages list for the current turn."""
-        available_tools = self._tools.available_tools() if self._tools is not None else []
-        return self._context_builder.build(
-            state=state,
-            registry=self._registry,
-            react_history=react_history,
-            history_messages=history_messages,
-            available_tools=available_tools,
-            stall_injection=stall_injection,
+    def _run_simple(self, user_input: str, history_messages: list[dict]) -> str:
+        """Run a simple task through the ReactAgent (single-step, no planning)."""
+        context = ""
+        if history_messages:
+            lines = [
+                f"{m['role']}: {m['content']}"
+                for m in history_messages
+                if m.get("role") in ("user", "assistant")
+            ]
+            context = "\n".join(lines)
+        task = SubTask(
+            step_id="simple-0",
+            description=user_input,
+            context=context,
+            goal=user_input,
         )
+        result = self._react_agent.run(task)
+        return result.output
 
-    def _apply_piggybacked_plan(self, action: Action, state: AgentState, observation: str) -> str:
+    def _restore_orchestrator_state(
+        self, initial_state: Optional[AgentState]
+    ) -> Optional[OrchestratorState]:
         """
-        If action.params contains "plan_update", apply it and append a note to the observation.
-        Not applicable to UPDATE_PLAN itself (it IS the plan action).
+        Adapt legacy AgentState (crash recovery) to OrchestratorState.
+        Only plan is carried over; results start empty (steps will re-run from last done).
         """
-        plan_data = action.params.get("plan_update")
-        if plan_data is None or action.type == ActionType.UPDATE_PLAN:
-            return observation
-        try:
-            new_plan = Plan.model_validate(plan_data)
-        except Exception:
-            return observation + "\n[Warning: plan_update ignored — invalid format]"
-        state.plan = state.plan.replace(new_plan) if state.plan else new_plan
-        self._sink.on_plan_updated(state.plan)
-        self._logger.emit(EventType.PLAN_UPDATED, state.plan.model_dump())
-        if self._run_dir is not None:
-            save_state(self._run_dir, state)
-        return observation + "\nPlan updated."
-
-    def _execute_action(self, action: Action, state: AgentState, streaming: bool = False) -> str:
-        """Execute a single Action, return observation string for next context."""
-
-        if action.type == ActionType.UPDATE_PLAN:
-            new_plan = Plan.model_validate(action.params["plan"])
-            state.plan = state.plan.replace(new_plan) if state.plan else new_plan
-            self._sink.on_plan_updated(state.plan)
-            self._logger.emit(EventType.PLAN_UPDATED, state.plan.model_dump())
-            if self._run_dir is not None:
-                save_state(self._run_dir, state)
-            return (
-                "Plan updated. No actual work was performed — "
-                "call write_file, run_script, or another work tool to do real tasks."
-            )
-
-        elif action.type == ActionType.LOAD_SKILL:
-            skill_name = action.params["skill_name"]
-            meta = self._registry.find(skill_name)
-            if not meta:
-                return f"Error: skill '{skill_name}' not found."
-            body, report = self._loader.load_body(meta)
-            state.active_skills.append(meta)
-            self._sink.on_progress("load_skill", skill_name)
-            self._logger.emit(EventType.SKILL_LOADED, {"skill": skill_name, **report})
-            # Display summary for user (not full body — that goes to model context only)
-            display_lines = [f"description: {meta.description}"]
-            if meta.allowed_tools:
-                display_lines.append(f"tools: {', '.join(meta.allowed_tools)}")
-            self._sink.on_observation(f"skill:{skill_name}", "\n".join(display_lines))
-            return f"[Skill: {skill_name}]\n{body}"
-
-        elif action.type == ActionType.LOAD_RESOURCE:
-            skill_name = action.params["skill_name"]
-            resource = action.params["resource"]
-            meta = self._registry.find(skill_name)
-            if not meta:
-                return f"Error: skill '{skill_name}' not found."
-            try:
-                excerpt, _report = self._loader.load_resource(
-                    meta, resource, section_hint=action.params.get("section_hint")
-                )
-            except PathTraversalError as e:
-                return f"PathTraversalBlocked: {e}"
-            self._sink.on_progress("load_resource", resource)
-            self._sink.on_observation(f"resource:{resource}", excerpt)
-            return f"[Resource: {resource}]\n{excerpt}"
-
-        elif action.type == ActionType.RUN_SCRIPT:
-            return self._handle_run_script(action, state)
-
-        elif action.type == ActionType.READ_FILE:
-            return self._handle_read_only_tool(
-                action,
-                tool_name="read_file",
-                call=lambda: self._tools.read_file(
-                    path=action.params["path"],
-                    max_bytes=action.params.get("max_bytes", 100_000),
-                ),
-                fmt=lambda r: r["content"] + ("\n[truncated]" if r.get("truncated") else ""),
-            )
-
-        elif action.type == ActionType.LIST_DIR:
-            return self._handle_read_only_tool(
-                action,
-                tool_name="list_dir",
-                call=lambda: self._tools.list_dir(
-                    path=action.params["path"],
-                    max_entries=action.params.get("max_entries", 100),
-                ),
-                fmt=lambda r: "\n".join(r["entries"]) + ("\n[truncated]" if r.get("truncated") else ""),
-            )
-
-        elif action.type == ActionType.GREP:
-            return self._handle_read_only_tool(
-                action,
-                tool_name="grep",
-                call=lambda: self._tools.grep(
-                    pattern=action.params["pattern"],
-                    path=action.params["path"],
-                    max_results=action.params.get("max_results", 50),
-                ),
-                fmt=lambda r: "\n".join(
-                    f"{m['file']}:{m['line']}: {m['content']}" for m in r["matches"]
-                ) + ("\n[truncated]" if r.get("truncated") else ""),
-            )
-
-        elif action.type == ActionType.WEB_SEARCH:
-            query = action.params.get("query", "")
-            return self._handle_read_only_tool(
-                action,
-                tool_name="web_search",
-                call=lambda: self._tools.web_search(
-                    query=query,
-                    max_results=action.params.get("max_results", 5),
-                ),
-                fmt=lambda r: "\n\n".join(
-                    f"[{i+1}] {res['title']}\n{res['url']}\n{res['content']}"
-                    for i, res in enumerate(r["results"])
-                ) or "(no results)",
-            )
-
-        elif action.type == ActionType.WRITE_FILE:
-            return self._handle_write_tool(action)
-
-        elif action.type == ActionType.DELETE_FILE:
-            return self._handle_write_tool(action)
-
-        elif action.type == ActionType.FINAL_ANSWER:
-            # Guard: reject final_answer if plan has incomplete steps
-            if state.plan is not None:
-                from agent.plan import StepStatus
-                incomplete = [
-                    s for s in state.plan.steps
-                    if s.status not in (StepStatus.DONE, StepStatus.FAILED)
-                ]
-                if incomplete:
-                    step_list = ", ".join(f"[{s.id}: {s.description}]" for s in incomplete)
-                    return (
-                        f"Error: cannot call final_answer while plan has incomplete steps: {step_list}. "
-                        "Complete all steps first, then call final_answer."
-                    )
-            content = action.params.get("content", "")
-            if not streaming:
-                self._sink.on_text_chunk(content, done=True)
-            self._logger.emit(EventType.FINAL_ANSWER, {"content": content})
-            state.status = "completed"
-            return content
-
-        else:
-            return f"Error: unknown action type '{action.type}'."
-
-    def _handle_run_script(self, action: Action, state: AgentState) -> str:
-        """
-        Handle RUN_SCRIPT action: permission check → path safety → approval → execute.
-
-        Returns an observation string in all cases (never raises).
-        Emits ACTION_FAILED on any error so the model can observe the failure.
-        """
-        if self._tools is None:
-            obs = "Error: script execution not enabled (ToolsRuntime not configured)."
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": ActionType.RUN_SCRIPT,
-                "reason": "tools_not_configured",
-            })
-            return obs
-
-        skill_name = action.params.get("skill_name", "")
-        script = action.params.get("script", "")
-        args = action.params.get("args", [])
-        env_overrides = action.params.get("env_overrides")
-
-        # Resolve the active skill metadata (must have been loaded first)
-        meta = next(
-            (m for m in state.active_skills if m.name == skill_name),
-            None,
+        if initial_state is None:
+            return None
+        return OrchestratorState(
+            session_id=initial_state.session_id,
+            user_input=initial_state.user_input,
+            plan=initial_state.plan,
         )
-        if meta is None:
-            obs = (
-                f"ToolNotAllowed: skill '{skill_name}' is not loaded. "
-                "Use LOAD_SKILL first."
-            )
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": ActionType.RUN_SCRIPT,
-                "reason": "skill_not_loaded",
-                "skill": skill_name,
-            })
-            return obs
-
-        try:
-            result = self._tools.run_script(
-                skill_meta=meta,
-                script=script,
-                args=args,
-                env_overrides=env_overrides,
-            )
-        except ToolNotAllowedError as exc:
-            obs = f"ToolNotAllowed: {exc}"
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": ActionType.RUN_SCRIPT,
-                "reason": "permission_denied",
-                "skill": skill_name,
-                "script": script,
-            })
-            self._sink.on_error(obs, recoverable=True)
-            return obs
-        except ApprovalDeniedError as exc:
-            obs = f"ApprovalDenied: {exc}"
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": ActionType.RUN_SCRIPT,
-                "reason": "approval_denied",
-                "skill": skill_name,
-                "script": script,
-            })
-            self._sink.on_error(obs, recoverable=True)
-            return obs
-        except ToolsRuntimeError as exc:
-            obs = f"ScriptError: {exc}"
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": ActionType.RUN_SCRIPT,
-                "reason": "runtime_error",
-                "detail": str(exc),
-            })
-            self._sink.on_error(obs, recoverable=True)
-            return obs
-
-        self._sink.on_progress("run_script", script)
-
-        if result.timed_out:
-            obs = (
-                f"ScriptTimedOut: '{script}' exceeded time limit.\n"
-                f"stderr: {result.stderr}"
-            )
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": ActionType.RUN_SCRIPT,
-                "reason": "timed_out",
-                "script": script,
-            })
-            return obs
-
-        obs_parts = [f"returncode={result.returncode}"]
-        if result.stdout:
-            obs_parts.append(f"stdout:\n{result.stdout}")
-        if result.stderr:
-            obs_parts.append(f"stderr:\n{result.stderr}")
-        obs = "\n".join(obs_parts)
-        self._sink.on_observation(f"script:{script}", obs)
-        return obs
-
-    def _handle_write_tool(self, action: Action) -> str:
-        """
-        Handle WRITE_FILE / DELETE_FILE actions: permission check → approval → execute.
-        Returns observation string in all cases (never raises).
-        """
-        if self._tools is None:
-            obs = f"Error: {action.type} not available (ToolsRuntime not configured)."
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": action.type,
-                "reason": "tools_not_configured",
-            })
-            return obs
-
-        try:
-            if action.type == ActionType.WRITE_FILE:
-                result = self._tools.write_file(
-                    path=action.params["path"],
-                    content=action.params["content"],
-                )
-                label = action.params["path"]
-            else:  # DELETE_FILE
-                result = self._tools.delete_file(path=action.params["path"])
-                label = action.params["path"]
-        except ToolNotAllowedError as exc:
-            obs = f"ToolNotAllowed: {exc}"
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": action.type, "reason": "permission_denied"})
-            self._sink.on_error(obs, recoverable=True)
-            return obs
-        except ApprovalDeniedError as exc:
-            obs = f"ApprovalDenied: {exc}"
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": action.type, "reason": "approval_denied"})
-            self._sink.on_error(obs, recoverable=True)
-            return obs
-
-        if "error" in result:
-            obs = f"Error: {result['error']}"
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": action.type,
-                "reason": "execution_error",
-                "detail": result["error"],
-            })
-            return obs
-
-        obs = f"{action.type} succeeded: {label}"
-        self._sink.on_progress(str(action.type), label)
-        return obs
-
-    def _handle_read_only_tool(
-        self,
-        action: Action,
-        tool_name: str,
-        call,
-        fmt,
-    ) -> str:
-        """
-        Generic handler for low-risk read-only tools (read_file, list_dir, grep).
-        No approval required; errors in the result dict are returned as observations.
-        """
-        if self._tools is None:
-            obs = f"Error: {tool_name} not available (ToolsRuntime not configured)."
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": action.type,
-                "reason": "tools_not_configured",
-            })
-            return obs
-
-        result = call()
-
-        if "error" in result:
-            obs = f"Error: {result['error']}"
-            self._logger.emit(EventType.ACTION_FAILED, {
-                "action_type": action.type,
-                "reason": "tool_error",
-                "detail": result["error"],
-            })
-            return obs
-
-        obs = fmt(result)
-        self._sink.on_progress(tool_name, action.params.get("path", ""))
-        self._sink.on_observation(f"{tool_name}:{action.params.get('path', '')}", obs)
-        return obs
-
-    def _check_dead_loop_hash(self, action: Action, state: AgentState) -> bool:
-        """
-        Maintain a sliding window of the last K action hashes.
-        Return True if any hash appears >= 2 times (dead loop detected).
-        """
-        key = json.dumps(
-            {"type": action.type, "params": action.params},
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-        h = hashlib.sha256(key.encode()).hexdigest()[:16]
-
-        state.recent_action_hashes.append(h)
-        if len(state.recent_action_hashes) > self._dead_loop_window:
-            state.recent_action_hashes.pop(0)
-
-        # Dead loop if any hash appears >= 2 times within the window
-        return len(state.recent_action_hashes) != len(set(state.recent_action_hashes))
