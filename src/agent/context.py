@@ -96,6 +96,39 @@ class DirectAnswerContextBuilder:
         return msgs
 
 
+# ── ClassifyAndAnswerContextBuilder ──────────────────────────────────────────
+
+_CLASSIFY_AND_ANSWER_SYSTEM = """\
+You are a helpful assistant. Decide whether the user's request can be answered
+immediately from general knowledge, or whether it needs tool use or planning.
+
+If it can be answered directly (no tools, no file reading, no planning needed):
+  Answer now. Output: {"type": "final_answer", "params": {"content": "<answer>"}}
+
+If it needs tool use or file access but is a single focused task (medium):
+  Output: {"type": "final_answer", "params": {"route": "medium"}}
+
+If it requires planning, writing files, or multiple distinct sequential steps (complex):
+  Output: {"type": "final_answer", "params": {"route": "complex"}}
+
+CRITICAL: Output ONLY a single JSON object — no prose, no markdown."""
+
+
+class ClassifyAndAnswerContextBuilder:
+    """Combines classification and direct answering in a single model call.
+
+    For simple requests the model answers directly (params.content is set).
+    For medium/complex the model signals routing (params.route is set).
+    Session history is included so direct answers are context-aware.
+    """
+
+    def build(self, user_input: str, history_messages: list[dict]) -> list[dict]:
+        msgs: list[dict] = [{"role": "system", "content": _CLASSIFY_AND_ANSWER_SYSTEM}]
+        msgs.extend(history_messages)
+        msgs.append({"role": "user", "content": user_input})
+        return msgs
+
+
 # ── OrchestratorContextBuilder ────────────────────────────────────────────────
 
 _ORCHESTRATOR_SYSTEM = """\

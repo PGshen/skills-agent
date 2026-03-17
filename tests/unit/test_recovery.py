@@ -188,7 +188,7 @@ class TestAgentCorePersistence:
         so that cli/run.py --resume and load_state() continue to work.
 
         Multi-agent protocol:
-          1. classify  → "complex"
+          1. classify+answer → route: "complex"
           2. decompose → UPDATE_PLAN (goal="test goal")
           3. ReactAgent step 1 → FINAL_ANSWER "step done"
           4. synthesize → FINAL_ANSWER "all done"
@@ -210,8 +210,8 @@ class TestAgentCorePersistence:
         loader = SkillLoader()
 
         actions = [
-            # 1. classify → complex
-            Action(type=ActionType.FINAL_ANSWER, params={"content": "complex"}),
+            # 1. classify+answer → route complex
+            Action(type=ActionType.FINAL_ANSWER, params={"route": "complex"}),
             # 2. decompose → plan
             Action(type=ActionType.UPDATE_PLAN, params={"plan": {
                 "goal": "test goal",

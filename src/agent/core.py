@@ -4,8 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 from agent.context import (
-    ClassifyContextBuilder,
-    DirectAnswerContextBuilder,
+    ClassifyAndAnswerContextBuilder,
     OrchestratorContextBuilder,
     _plan_summary as _format_plan_summary,  # noqa: F401 — re-export for tests
 )
@@ -101,8 +100,8 @@ class AgentCore:
         # Restore OrchestratorState from legacy AgentState if provided
         orch_state = self._restore_orchestrator_state(initial_state)
 
-        # Classify
-        complexity = self._classify(user_input)
+        # Classify and, for simple tasks, answer in a single model call
+        complexity, direct_answer = self._classify_and_answer(user_input, history_messages)
         self._sink.on_route_decision(complexity.value)
         self._logger.emit(EventType.ROUTE_DECISION, {
             "complexity": complexity.value,
@@ -110,7 +109,7 @@ class AgentCore:
         })
 
         if complexity == TaskComplexity.SIMPLE:
-            return self._run_direct(user_input, history_messages)
+            return direct_answer
         elif complexity == TaskComplexity.MEDIUM:
             return self._run_medium(user_input, history_messages)
         else:
@@ -122,45 +121,43 @@ class AgentCore:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _classify(self, user_input: str) -> TaskComplexity:
-        """One model call to classify task complexity. Defaults to COMPLEX on any failure."""
-        messages = ClassifyContextBuilder().build(user_input)
-        self._sink.on_thinking_start(0, "Classifying…")
-        try:
-            action = self._model.next_action(messages)
-            if action.type == ActionType.FINAL_ANSWER:
-                content = action.params.get("content", "").strip().lower()
-                if "simple" in content:
-                    return TaskComplexity.SIMPLE
-                if "medium" in content:
-                    return TaskComplexity.MEDIUM
-        except (ModelResponseError, Exception):
-            pass
-        return TaskComplexity.COMPLEX  # conservative default
+    def _classify_and_answer(
+        self, user_input: str, history_messages: list[dict]
+    ) -> tuple[TaskComplexity, str]:
+        """Single model call: classify and — for simple tasks — answer directly.
 
-    def _run_direct(self, user_input: str, history_messages: list[dict]) -> str:
-        """Answer a simple question directly — one model call with session history."""
-        messages = DirectAnswerContextBuilder().build(user_input, history_messages)
+        Returns (complexity, content):
+          SIMPLE  — content is the answer; streaming already delivered to sink.
+          MEDIUM  — content is ""; caller routes to ReactAgent.
+          COMPLEX — content is ""; caller routes to OrchestratorAgent.
+
+        Streaming note: next_action_streaming only fires on_text_chunk for
+        $.params.content, so routing responses (which use $.params.route)
+        produce no premature output.
+        """
+        messages = ClassifyAndAnswerContextBuilder().build(user_input, history_messages)
         response_format = build_action_response_format(["final_answer"])
-        self._sink.on_thinking_start(0, "Answering…")
+        self._sink.on_thinking_start(0, "Thinking…")
         try:
             if hasattr(self._model, "next_action_streaming"):
                 action = self._model.next_action_streaming(messages, response_format=response_format)
-                # Streaming: sink.on_text_chunk already called inside next_action_streaming
             else:
                 action = self._model.next_action(messages, response_format=response_format)
-            content = (
-                action.params.get("content", "")
-                if action.type == ActionType.FINAL_ANSWER
-                else str(action.params)
-            )
-            if not hasattr(self._model, "next_action_streaming"):
-                self._sink.on_text_chunk(content, done=True)
-        except (ModelResponseError, Exception) as exc:
-            content = f"Error: {exc}"
-            self._sink.on_text_chunk(content, done=True)
-        self._logger.emit(EventType.FINAL_ANSWER, {"content": content})
-        return content
+            if action.type == ActionType.FINAL_ANSWER:
+                route = action.params.get("route", "")
+                if route:  # routing intent present
+                    if route.strip().lower() == "medium":
+                        return TaskComplexity.MEDIUM, ""
+                    return TaskComplexity.COMPLEX, ""  # "complex" or unrecognised
+                # No route field → direct answer (simple task)
+                content = action.params.get("content", "")
+                if not hasattr(self._model, "next_action_streaming"):
+                    self._sink.on_text_chunk(content, done=True)
+                self._logger.emit(EventType.FINAL_ANSWER, {"content": content})
+                return TaskComplexity.SIMPLE, content
+        except (ModelResponseError, Exception):
+            pass
+        return TaskComplexity.COMPLEX, ""
 
     def _run_medium(self, user_input: str, history_messages: list[dict]) -> str:
         """Delegate a medium task to ReactAgent (tool use, single focused task)."""

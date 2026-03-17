@@ -48,19 +48,14 @@ def make_core(
     )
 
 
-def classify_simple() -> Action:
-    """Classification response: simple task."""
-    return Action(type=ActionType.FINAL_ANSWER, params={"content": "simple"})
+def route_medium() -> Action:
+    """Combined classify+answer response: route to medium."""
+    return Action(type=ActionType.FINAL_ANSWER, params={"route": "medium"})
 
 
-def classify_medium() -> Action:
-    """Classification response: medium task."""
-    return Action(type=ActionType.FINAL_ANSWER, params={"content": "medium"})
-
-
-def classify_complex() -> Action:
-    """Classification response: complex task."""
-    return Action(type=ActionType.FINAL_ANSWER, params={"content": "complex"})
+def route_complex() -> Action:
+    """Combined classify+answer response: route to complex."""
+    return Action(type=ActionType.FINAL_ANSWER, params={"route": "complex"})
 
 
 def decompose_action(goal: str, steps: list[dict]) -> Action:
@@ -116,21 +111,19 @@ class TestFormatPlanSummary:
 class TestSimpleRoute:
     def test_simple_classification_returns_direct_answer(self, tmp_path):
         """
-        MockModel sequence:
-          1. classify → "simple"
-          2. direct_answer (DirectAnswerContextBuilder) → FINAL_ANSWER "quicksort is..."
+        Combined classify+answer call returns FINAL_ANSWER with content directly.
+        Simple tasks now take 1 model call instead of 2.
         """
         model = MockModel([
-            classify_simple(),
             final_answer("quicksort is a divide-and-conquer algorithm"),
         ])
         core = make_core(model, tmp_path)
         result = core.run("What is quicksort?")
         assert result == "quicksort is a divide-and-conquer algorithm"
-        assert model.call_count == 2
+        assert model.call_count == 1
 
     def test_simple_route_emits_route_decision_event(self, tmp_path):
-        model = MockModel([classify_simple(), final_answer("answer")])
+        model = MockModel([final_answer("answer")])
         core = make_core(model, tmp_path)
         core.run("hello")
         events = read_events(tmp_path)
@@ -139,7 +132,7 @@ class TestSimpleRoute:
         assert route_events[0]["data"]["complexity"] == "simple"
 
     def test_simple_route_emits_final_answer_event(self, tmp_path):
-        model = MockModel([classify_simple(), final_answer("the answer")])
+        model = MockModel([final_answer("the answer")])
         core = make_core(model, tmp_path)
         core.run("hello")
         events = read_events(tmp_path)
@@ -154,30 +147,30 @@ class TestSimpleRoute:
             def on_text_chunk(self, chunk, done):
                 chunks.append((chunk, done))
 
-        model = MockModel([classify_simple(), final_answer("my answer")])
+        model = MockModel([final_answer("my answer")])
         core = make_core(model, tmp_path, sink=TrackingSink())
         core.run("something simple")
         assert chunks == [("my answer", True)]
 
-    def test_simple_classification_does_not_invoke_orchestrator(self, tmp_path):
-        """Simple tasks: only 2 model calls — classify + direct answer (no ReactAgent)."""
-        model = MockModel([classify_simple(), final_answer("direct")])
+    def test_simple_does_not_invoke_orchestrator(self, tmp_path):
+        """Simple tasks: 1 model call (classify+answer combined, no ReactAgent)."""
+        model = MockModel([final_answer("direct")])
         core = make_core(model, tmp_path)
         core.run("simple question")
-        assert model.call_count == 2
+        assert model.call_count == 1
 
-    def test_simple_direct_answer_includes_history(self, tmp_path):
-        """History messages are injected into the direct-answer call for simple tasks."""
+    def test_simple_answer_includes_history(self, tmp_path):
+        """History messages are injected into the combined classify+answer call."""
         history = [
             {"role": "user", "content": "prior question"},
             {"role": "assistant", "content": "prior answer"},
         ]
-        model = MockModel([classify_simple(), final_answer("answer")])
+        model = MockModel([final_answer("answer")])
         core = make_core(model, tmp_path)
         core.run("follow-up question", history_messages=history)
-        # Direct answer call is the second call (index 1)
-        direct_msgs = model.call_history[1]
-        contents = [m["content"] for m in direct_msgs]
+        # The single combined call includes history
+        call_msgs = model.call_history[0]
+        contents = [m["content"] for m in call_msgs]
         assert any("prior question" in c for c in contents)
 
 
@@ -189,11 +182,11 @@ class TestMediumRoute:
     def test_medium_route_returns_react_answer(self, tmp_path):
         """
         MockModel sequence:
-          1. classify → "medium"
+          1. classify+answer → route: medium
           2. ReactAgent → FINAL_ANSWER "found 3 TODOs"
         """
         model = MockModel([
-            classify_medium(),
+            route_medium(),
             final_answer("found 3 TODOs"),
         ])
         core = make_core(model, tmp_path)
@@ -202,7 +195,7 @@ class TestMediumRoute:
         assert model.call_count == 2
 
     def test_medium_route_emits_route_decision_event(self, tmp_path):
-        model = MockModel([classify_medium(), final_answer("answer")])
+        model = MockModel([route_medium(), final_answer("answer")])
         core = make_core(model, tmp_path)
         core.run("something medium")
         events = read_events(tmp_path)
@@ -211,8 +204,8 @@ class TestMediumRoute:
         assert route_events[0]["data"]["complexity"] == "medium"
 
     def test_medium_does_not_invoke_orchestrator(self, tmp_path):
-        """Medium: classify + react = 2 calls, no orchestrator decompose/synthesize."""
-        model = MockModel([classify_medium(), final_answer("result")])
+        """Medium: route + react = 2 calls, no orchestrator decompose/synthesize."""
+        model = MockModel([route_medium(), final_answer("result")])
         core = make_core(model, tmp_path)
         core.run("read and summarize file")
         assert model.call_count == 2
@@ -226,7 +219,7 @@ class TestComplexRoute:
     def _complex_actions(self) -> list[Action]:
         """Full mock sequence for a 1-step complex task."""
         return [
-            classify_complex(),
+            route_complex(),
             decompose_action("write quicksort", [
                 {"id": "1", "description": "write the code", "status": "pending"},
             ]),
@@ -256,9 +249,9 @@ class TestComplexRoute:
         assert model.call_count == 4
 
     def test_complex_two_steps_model_call_count(self, tmp_path):
-        """classify + decompose + react(step1) + react(step2) + synthesize = 5 calls."""
+        """route + decompose + react(step1) + react(step2) + synthesize = 5 calls."""
         model = MockModel([
-            classify_complex(),
+            route_complex(),
             decompose_action("build app", [
                 {"id": "1", "description": "write code", "status": "pending"},
                 {"id": "2", "description": "write tests", "status": "pending"},
@@ -278,11 +271,11 @@ class TestComplexRoute:
 # ---------------------------------------------------------------------------
 
 class TestClassificationFallback:
-    def test_unknown_classification_defaults_to_complex(self, tmp_path):
-        """If model returns an unrecognised label, default to complex."""
+    def test_unknown_route_value_defaults_to_complex(self, tmp_path):
+        """If model returns an unrecognised route value, default to complex."""
         model = MockModel([
-            # Returns "banana" — not simple/medium/complex → defaults to complex
-            final_answer("banana"),
+            # Returns route: "banana" — not medium/complex → defaults to complex
+            Action(type=ActionType.FINAL_ANSWER, params={"route": "banana"}),
             decompose_action("goal", [
                 {"id": "1", "description": "do it", "status": "pending"},
             ]),
@@ -334,7 +327,7 @@ class TestSinkCallbacks:
             def on_route_decision(self, complexity):
                 decisions.append(complexity)
 
-        model = MockModel([classify_simple(), final_answer("answer")])
+        model = MockModel([final_answer("answer")])
         core = make_core(model, tmp_path, sink=TrackingSink())
         core.run("simple task")
         assert decisions == ["simple"]
@@ -347,7 +340,7 @@ class TestSinkCallbacks:
                 decisions.append(complexity)
 
         model = MockModel([
-            classify_complex(),
+            route_complex(),
             decompose_action("g", [{"id": "1", "description": "s", "status": "pending"}]),
             final_answer("step done"),
             final_answer("done"),
@@ -362,21 +355,18 @@ class TestSinkCallbacks:
 # ---------------------------------------------------------------------------
 
 class TestHistoryMessages:
-    def test_classify_call_does_not_include_history(self, tmp_path):
-        """Classification is stateless by design — history is not injected."""
+    def test_combined_call_includes_history(self, tmp_path):
+        """The combined classify+answer call injects session history."""
         history = [
             {"role": "user", "content": "prior question"},
             {"role": "assistant", "content": "prior answer"},
         ]
-        model = MockModel([classify_simple(), final_answer("answer")])
+        model = MockModel([final_answer("answer")])
         core = make_core(model, tmp_path)
         core.run("new question", history_messages=history)
-        # The classify call is a single user message (no history injected)
-        classify_msgs = model.call_history[0]
-        assert len(classify_msgs) == 1
-        assert classify_msgs[0]["role"] == "user"
-        contents = [m["content"] for m in classify_msgs]
-        assert not any("prior question" in c for c in contents)
+        call_msgs = model.call_history[0]
+        contents = [m["content"] for m in call_msgs]
+        assert any("prior question" in c for c in contents)
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +393,7 @@ class TestInitialStateCompat:
         )
 
         model = MockModel([
-            classify_complex(),            # EntryAgent classifies
+            route_complex(),               # EntryAgent classify+answer → complex
             # No decompose — plan already in OrchestratorState
             final_answer("step 2 done"),   # ReactAgent step 2
             final_answer("recovered"),     # synthesize
