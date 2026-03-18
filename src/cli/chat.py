@@ -2,6 +2,15 @@
 
 import sys
 
+# Enable proper line editing: arrow-key cursor movement, Unicode-aware
+# backspace (critical for CJK characters), and input history.
+try:
+    import readline as _readline  # noqa: F401
+
+    _readline.parse_and_bind("tab: complete")
+except ImportError:
+    pass  # Windows — graceful degradation to plain input()
+
 from agent.core import AgentCore
 from common.config import get_config
 from output.cli_sink import CLISink

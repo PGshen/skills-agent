@@ -207,12 +207,66 @@ class DeleteFileResult:
 
 
 class WriteFileExecutor:
-    """Write (or overwrite) a file, creating parent directories as needed."""
+    """Write a file in one of two modes:
 
-    def run(self, path: Path, content: str) -> WriteFileResult:
+    - Full overwrite: pass ``content`` (creates or replaces the whole file).
+    - Patch:          pass ``old_str`` + ``new_str`` (replaces the first and
+                      only occurrence of ``old_str``; fails if 0 or >1 matches).
+
+    Exactly one mode must be chosen per call.
+    """
+
+    def run(
+        self,
+        path: Path,
+        content: Optional[str] = None,
+        *,
+        old_str: Optional[str] = None,
+        new_str: Optional[str] = None,
+    ) -> WriteFileResult:
+        if content is not None and old_str is not None:
+            return WriteFileResult(
+                success=False,
+                error="Provide either 'content' (overwrite) or 'old_str'/'new_str' (patch), not both.",
+            )
+        if content is None and old_str is None:
+            return WriteFileResult(
+                success=False,
+                error="Provide either 'content' (overwrite) or 'old_str'/'new_str' (patch).",
+            )
+
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            if content is not None:
+                # ── Full overwrite ────────────────────────────────────────────
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            else:
+                # ── Patch ─────────────────────────────────────────────────────
+                if new_str is None:
+                    return WriteFileResult(
+                        success=False, error="'new_str' is required when using patch mode."
+                    )
+                if not path.exists():
+                    return WriteFileResult(
+                        success=False, error=f"File not found: {path}"
+                    )
+                original = path.read_text(encoding="utf-8")
+                count = original.count(old_str)  # type: ignore[arg-type]
+                if count == 0:
+                    return WriteFileResult(
+                        success=False,
+                        error="'old_str' not found in file — no changes made.",
+                    )
+                if count > 1:
+                    return WriteFileResult(
+                        success=False,
+                        error=(
+                            f"'old_str' found {count} times in file; "
+                            "it must match exactly once for a safe patch."
+                        ),
+                    )
+                path.write_text(original.replace(old_str, new_str, 1), encoding="utf-8")  # type: ignore[arg-type]
+
             return WriteFileResult(success=True)
         except PermissionError as exc:
             return WriteFileResult(success=False, error=f"Permission denied: {exc}")
@@ -274,8 +328,8 @@ class TavilyAdapter(WebSearchAdapter):
         try:
             resp = requests.post(
                 self._BASE_URL,
+                headers={"Authorization": f"Bearer {self._api_key}"},
                 json={
-                    "api_key": self._api_key,
                     "query": query,
                     "max_results": max_results,
                     "include_answer": False,

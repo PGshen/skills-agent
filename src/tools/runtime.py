@@ -173,24 +173,44 @@ class ToolsRuntime:
     # Write tools (high-risk, require permission + approval)
     # ------------------------------------------------------------------
 
-    def write_file(self, path: str, content: str) -> dict:
+    def write_file(
+        self,
+        path: str,
+        content: str | None = None,
+        old_str: str | None = None,
+        new_str: str | None = None,
+    ) -> dict:
         """
-        Write content to a file. High-risk, requires approval.
+        Write or patch a file. High-risk, requires approval.
+
+        Overwrite mode:  pass ``content`` (full file text).
+        Patch mode:      pass ``old_str`` + ``new_str`` (unique substring replacement).
+
         Returns {"success": True} or {"error": "..."}.
         """
         if not self._permission.check("write_file"):
             raise ToolNotAllowedError("write_file is not in the allowed tool set")
 
+        if content is not None:
+            approval_params: dict = {"path": path, "mode": "overwrite", "preview": content[:200]}
+        else:
+            approval_params = {
+                "path": path,
+                "mode": "patch",
+                "old_str": (old_str or "")[:200],
+                "new_str": (new_str or "")[:200],
+            }
+
         req = ApprovalRequest(
             tool="write_file",
             risk="high",
-            params={"path": path, "preview": content[:200]},
+            params=approval_params,
             skill_name="",
         )
         if not self._approval.request(req):
             raise ApprovalDeniedError("User denied write_file approval")
 
-        result = WriteFileExecutor().run(Path(path), content)
+        result = WriteFileExecutor().run(Path(path), content, old_str=old_str, new_str=new_str)
         if not result.success:
             return {"error": result.error}
         return {"success": True}

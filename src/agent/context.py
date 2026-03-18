@@ -111,6 +111,9 @@ If it needs tool use or file access but is a single focused task (medium):
 If it requires planning, writing files, or multiple distinct sequential steps (complex):
   Output: {"type": "final_answer", "params": {"route": "complex"}}
 
+LANGUAGE: Always write the "content" value in the same language as the user's message, \
+unless the user explicitly requests a different language.
+
 CRITICAL: Output ONLY a single JSON object — no prose, no markdown."""
 
 
@@ -171,6 +174,8 @@ Step results:
 {step_results}
 
 Write a clear, complete response. Include relevant outputs, file paths, or summaries.
+Always write the "content" value in the same language as the user's request above, \
+unless the user explicitly requested a different language.
 Output a single JSON object:
 {{"type": "final_answer", "params": {{"content": "<your complete answer>"}}}}"""
 
@@ -317,13 +322,18 @@ CRITICAL: Every reply MUST be a single valid JSON object — no prose, no markdo
 - Use work tools to make progress; call final_answer only when the task is complete or definitively blocked.
 - Do NOT plan, reflect, or narrate — just act.
 - Output ONLY the JSON object — no extra keys, no null-valued keys.
+- LANGUAGE: Write the final_answer "content" in the same language as the user's original request, unless the user explicitly requested a different language.
 """
 
 _REACT_TOOL_DECLARATIONS: dict[str, str] = {
     "read_file":   '- "read_file":   {{"path": "<path>", "max_bytes": 100000}}',
     "list_dir":    '- "list_dir":    {{"path": "<directory>", "max_entries": 100}}',
     "grep":        '- "grep":        {{"pattern": "<regex>", "path": "<directory or file>", "max_results": 50}}',
-    "write_file":  '- "write_file":  {{"path": "<path>", "content": "<full file content>"}}  [requires approval]',
+    "write_file":  (
+        '- "write_file" (overwrite): {{"path": "<path>", "content": "<full file content>"}}  [requires approval]\n'
+        '- "write_file" (patch):     {{"path": "<path>", "old_str": "<exact text to replace>", "new_str": "<replacement text>"}}  [requires approval]\n'
+        '  Patch rules: old_str must match exactly once; prefer patch over overwrite for targeted edits.'
+    ),
     "delete_file": '- "delete_file": {{"path": "<path>"}}  [requires approval]',
     "web_search":  '- "web_search":  {{"query": "<search query>", "max_results": 5}}',
 }

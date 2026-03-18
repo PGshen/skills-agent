@@ -32,6 +32,6 @@
       "run_script", "write_file", "delete_file", "web_search"
     ],
     "interactive": true,
-    "tavily_api_key": "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"
+    "tavily_api_key": ""
   }
 }
