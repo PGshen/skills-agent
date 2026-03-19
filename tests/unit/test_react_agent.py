@@ -257,25 +257,30 @@ class TestDeadLoopDetection:
 # ---------------------------------------------------------------------------
 
 class TestMaxTurns:
-    def test_max_turns_returns_failed_result(self, tmp_path):
+    def test_max_turns_triggers_graceful_finish(self, tmp_path):
+        """When turns are exhausted the agent makes one extra call to wrap up."""
         model = MockModel([
             Action(type=ActionType.LOAD_SKILL, params={"skill_name": "example-skill"}),
             Action(type=ActionType.LOAD_SKILL, params={"skill_name": "advanced-skill"}),
+            # graceful-finish turn: MockModel exhausted → auto FINAL_ANSWER
         ])
         # max_turns=2, dead_loop_window=10 so no dead loop fires
         agent = make_agent(model, tmp_path, max_turns=2, dead_loop_window=10)
         result = agent.run(make_subtask())
-        assert result.success is False
-        assert "max_turns" in result.output
+        # graceful finish produced a FINAL_ANSWER (MockModel exhausted → auto-answer)
+        assert result.output != ""
+        assert not result.output.startswith("FAILED: dead_loop")
 
     def test_max_turns_exhausted_model_call_count(self, tmp_path):
+        """Graceful finish adds one extra model call beyond max_turns."""
         model = MockModel([
             Action(type=ActionType.LOAD_SKILL, params={"skill_name": "example-skill"}),
             Action(type=ActionType.LOAD_SKILL, params={"skill_name": "advanced-skill"}),
         ])
         agent = make_agent(model, tmp_path, max_turns=2, dead_loop_window=10)
         agent.run(make_subtask())
-        assert model.call_count == 2
+        # 2 loop turns + 1 graceful-finish call
+        assert model.call_count == 3
 
 
 # ---------------------------------------------------------------------------

@@ -162,7 +162,7 @@ class GrepExecutor:
     def run(self, pattern: str, root: Path, max_results: int = 50) -> dict:
         try:
             compiled = re.compile(pattern)
-        except re.error as exc:
+        except (re.error, TypeError) as exc:
             return {"error": f"Invalid regex pattern: {exc}"}
 
         matches: list[dict] = []

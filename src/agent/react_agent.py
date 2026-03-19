@@ -64,7 +64,7 @@ class ReactAgent:
         event_logger: EventLogger,
         tools=None,
         sink: OutputSink = None,
-        max_turns: int = 10,
+        max_turns: int = 15,
         dead_loop_window: int = 4,
         max_context_tokens: int = 100_000,
         context_builder: Optional[ReactContextBuilder] = None,
@@ -86,11 +86,19 @@ class ReactAgent:
         Execute a single atomic SubTask. Returns TaskResult (never raises).
         """
         available_tools = self._tools.available_tools() if self._tools is not None else []
+        skills_index = self._registry.to_index_text() if self._registry else ""
 
-        # Build response format restricted to action types actually shown in the prompt
+        # Build response format restricted to action types actually shown in the prompt.
+        # Skill actions are always included when skills are available — they are handled
+        # natively by ReactAgent, not via ToolsRuntime, so they don't appear in
+        # available_tools but must still be in the schema.
         schema_action_types = list(
             (set(available_tools) & ReactContextBuilder.DECLARED_TOOLS) | {"final_answer"}
         )
+        if skills_index and skills_index != "(no skills available)":
+            for at in ("load_skill", "load_resource"):
+                if at not in schema_action_types:
+                    schema_action_types.append(at)
         react_format = build_action_response_format(schema_action_types)
 
         state = ReactState(
@@ -108,7 +116,9 @@ class ReactAgent:
         while not state.is_done() and state.turn_count < self._max_turns:
             state.turn_count += 1
 
-            messages = self._ctx_builder.build(task, react_history, available_tools)
+            messages = self._ctx_builder.build(
+                task, react_history, available_tools, skills_index=skills_index
+            )
             self._sink.on_thinking_start(state.turn_count)
 
             try:
@@ -154,13 +164,17 @@ class ReactAgent:
                 break
 
         if final_result is None:
-            # Exhausted turns or dead loop — treat as failure
-            reason = "dead_loop" if state.dead_loop_triggered else "max_turns_exceeded"
-            final_result = TaskResult(
-                step_id=task.step_id,
-                success=False,
-                output=f"FAILED: {reason}",
-            )
+            if state.dead_loop_triggered:
+                final_result = TaskResult(
+                    step_id=task.step_id,
+                    success=False,
+                    output="FAILED: dead_loop",
+                )
+            else:
+                # Turns exhausted — ask the model to wrap up based on progress so far
+                final_result = self._request_graceful_finish(
+                    task, react_history, available_tools, skills_index, react_format
+                )
 
         self._logger.emit(EventType.SESSION_END, {
             "subtask": task.step_id,
@@ -168,6 +182,58 @@ class ReactAgent:
             "success": final_result.success,
         })
         return final_result
+
+    # ── Graceful finish ───────────────────────────────────────────────────────
+
+    def _request_graceful_finish(
+        self,
+        task: SubTask,
+        react_history: list[tuple[Action, str]],
+        available_tools: list[str],
+        skills_index: str,
+        react_format,
+    ) -> TaskResult:
+        """Make one final model call when turns are exhausted.
+
+        Injects a stall_injection message that instructs the model to call
+        final_answer immediately with the best result it can provide from
+        the work done so far. Falls back to a FAILED result if the model
+        does not comply.
+        """
+        nudge = (
+            "You have reached the maximum number of turns. "
+            "You MUST call final_answer RIGHT NOW with the best result you can provide "
+            "based on the work done so far. Do NOT call any more tools."
+        )
+        messages = self._ctx_builder.build(
+            task, react_history, available_tools,
+            stall_injection=nudge, skills_index=skills_index,
+        )
+        self._sink.on_thinking_start(0, "Wrapping up…")
+        try:
+            if hasattr(self._model, "next_action_streaming"):
+                action = self._model.next_action_streaming(messages, response_format=react_format)
+            else:
+                action = self._model.next_action(messages, response_format=react_format)
+        except ModelResponseError:
+            return TaskResult(
+                step_id=task.step_id,
+                success=False,
+                output="FAILED: max_turns_exceeded",
+            )
+
+        if action.type == ActionType.FINAL_ANSWER:
+            content = action.params.get("content", "")
+            if not hasattr(self._model, "next_action_streaming"):
+                self._sink.on_text_chunk(content, done=True)
+            self._logger.emit(EventType.FINAL_ANSWER, {"content": content, "graceful": True})
+            success = not content.startswith("FAILED:")
+            return TaskResult(step_id=task.step_id, success=success, output=content)
+
+        # Model ignored the instruction — return partial failure with whatever we have
+        last_output = react_history[-1][1] if react_history else ""
+        partial = f"[Partial result — max turns reached]\n{last_output}" if last_output else "FAILED: max_turns_exceeded"
+        return TaskResult(step_id=task.step_id, success=False, output=partial)
 
     # ── Action dispatch ───────────────────────────────────────────────────────
 
@@ -246,8 +312,8 @@ class ReactAgent:
             obs = self._handle_read_only_tool(
                 action, "grep",
                 call=lambda: self._tools.grep(
-                    pattern=action.params["pattern"],
-                    path=action.params["path"],
+                    pattern=action.params.get("pattern", ""),
+                    path=action.params.get("path", "."),
                     max_results=action.params.get("max_results", 50),
                 ),
                 fmt=lambda r: "\n".join(

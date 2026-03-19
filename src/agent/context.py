@@ -126,8 +126,21 @@ class ClassifyAndAnswerContextBuilder:
     Session history is included so direct answers are context-aware.
     """
 
-    def build(self, user_input: str, history_messages: list[dict]) -> list[dict]:
+    def build(
+        self,
+        user_input: str,
+        history_messages: list[dict],
+        skills_index: str = "",
+    ) -> list[dict]:
         system = f"Today's date is {date.today().isoformat()}.\n" + _CLASSIFY_AND_ANSWER_SYSTEM
+        if skills_index and skills_index != "(no skills available)":
+            system += (
+                "\n\nAVAILABLE SKILLS (specialized task instructions):\n"
+                f"{skills_index}\n"
+                "When the user's request matches or is closely related to one of these skills "
+                '(e.g. reviewing code → code-review, committing → git-commit), route as "medium". '
+                "Prefer routing to a skill over answering directly whenever a relevant skill exists."
+            )
         msgs: list[dict] = [{"role": "system", "content": system}]
         msgs.extend(history_messages)
         msgs.append({"role": "user", "content": user_input})
@@ -314,7 +327,7 @@ CRITICAL: Every reply MUST be a single valid JSON object — no prose, no markdo
 ---
 
 ## 1. Work tools  (use these to gather information and make changes)
-{tools_section}
+{tools_section}{skills_section}
 
 ## 2. Termination  (call exactly once when done — do NOT use as a tool)
 - "final_answer": {{"content": "<concise result summary or FAILED: <reason>"}}
@@ -348,6 +361,27 @@ _REACT_TOOL_SECTIONS: list[tuple[str, list[str]]] = [
 ]
 
 
+def _build_skills_section(skills_index: str) -> str:
+    """Build the '### Skills' block injected into the React system prompt.
+
+    Returns an empty string when no skills are available so the surrounding
+    whitespace in _REACT_SYSTEM_HEADER is not affected.
+    """
+    if not skills_index or skills_index == "(no skills available)":
+        return ""
+    return (
+        "\n\n### Skills  (task-specific instruction sets)\n"
+        "IMPORTANT: If a skill below matches your task, call load_skill FIRST "
+        "before using any other tools — it provides the instructions and approach you should follow.\n"
+        f"{skills_index}\n"
+        '- "load_skill":    {{"skill_name": "<name>"}}'
+        "  — load task-specific instructions into context\n"
+        '- "load_resource": {{"skill_name": "<name>", "resource": "<rel-path>", '
+        '"section_hint": "<optional-section>"}}'
+        "  — load a skill's reference file"
+    )
+
+
 def _build_react_tools_section(available_tools: list[str]) -> str:
     effective = set(available_tools)
     lines: list[str] = []
@@ -359,7 +393,9 @@ def _build_react_tools_section(available_tools: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _build_react_system_prompt(task: SubTask, available_tools: list[str]) -> str:
+def _build_react_system_prompt(
+    task: SubTask, available_tools: list[str], skills_index: str = ""
+) -> str:
     context_section = ""
     if task.context:
         context_section = f"BACKGROUND:\n{task.context}\n"
@@ -369,6 +405,7 @@ def _build_react_system_prompt(task: SubTask, available_tools: list[str]) -> str
         context_section=context_section,
         goal=task.goal or task.description,
         tools_section=_build_react_tools_section(available_tools),
+        skills_section=_build_skills_section(skills_index),
     )
 
 
@@ -388,9 +425,12 @@ class ReactContextBuilder:
 
     # Tool names that appear in the system prompt — used by ReactAgent to
     # compute the allowed response format schema.
+    # load_skill / load_resource are handled natively by ReactAgent (not via
+    # ToolsRuntime) so they are added here explicitly rather than via
+    # _REACT_TOOL_SECTIONS which only covers ToolsRuntime-managed tools.
     DECLARED_TOOLS: frozenset[str] = frozenset(
         t for _, tools in _REACT_TOOL_SECTIONS for t in tools
-    )
+    ) | frozenset({"load_skill", "load_resource"})
 
     def __init__(
         self,
@@ -406,14 +446,17 @@ class ReactContextBuilder:
         react_history: list[tuple],
         available_tools: list[str],
         stall_injection: Optional[str] = None,
+        skills_index: str = "",
     ) -> list[dict]:
         """Build the messages list for one ReactAgent turn.
 
         react_history: list of (Action|dict|str, observation_str) tuples
         available_tools: tool names actually configured in ToolsRuntime
         stall_injection: optional nudge message appended last
+        skills_index: registry index text injected into the Skills section;
+                      empty string suppresses the section entirely
         """
-        system_prompt = _build_react_system_prompt(task, available_tools)
+        system_prompt = _build_react_system_prompt(task, available_tools, skills_index)
         msgs = self._assemble(system_prompt, react_history, stall_injection)
 
         total = sum(estimate_tokens(m.get("content", "")) for m in msgs)

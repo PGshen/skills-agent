@@ -23,7 +23,7 @@ class SessionContext(BaseModel):
     recent_turns: list[ConversationTurn] = Field(default_factory=list)
     last_used_skills: list[str] = Field(default_factory=list)
     total_turn_count: int = 0
-    recent_window_k: int = 3               # number of recent turns to keep verbatim
+    recent_window_k: int = 5               # number of recent turns to keep verbatim
 
     def build_history_messages(self) -> list[dict]:
         """

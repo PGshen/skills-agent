@@ -33,7 +33,7 @@ class TestSessionContext:
         assert ctx.recent_turns == []
         assert ctx.last_used_skills == []
         assert ctx.total_turn_count == 0
-        assert ctx.recent_window_k == 3
+        assert ctx.recent_window_k == 5
         assert len(ctx.session_id) == 36  # UUID format
 
     def test_unique_session_ids(self):

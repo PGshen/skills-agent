@@ -76,7 +76,7 @@ class AgentCore:
             event_logger=event_logger,
             tools=tools,
             sink=self._sink,
-            max_turns=5,
+            max_turns=max_turns,
             dead_loop_window=dead_loop_window,
             max_context_tokens=max_context_tokens,
         )
@@ -135,7 +135,10 @@ class AgentCore:
         $.params.content, so routing responses (which use $.params.route)
         produce no premature output.
         """
-        messages = ClassifyAndAnswerContextBuilder().build(user_input, history_messages)
+        skills_index = self._registry.to_index_text() if self._registry else ""
+        messages = ClassifyAndAnswerContextBuilder().build(
+            user_input, history_messages, skills_index=skills_index
+        )
         response_format = build_action_response_format(["final_answer"])
         self._sink.on_thinking_start(0, "Thinking…")
         try:

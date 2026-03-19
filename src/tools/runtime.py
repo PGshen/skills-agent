@@ -139,14 +139,20 @@ class ToolsRuntime:
 
     def read_file(self, path: str, max_bytes: int = 100_000) -> dict:
         """Read a file. Low-risk, no approval required."""
+        if not path:
+            return {"error": "read_file requires a non-empty 'path' parameter"}
         return ReadFileExecutor().run(Path(path), max_bytes=max_bytes)
 
     def list_dir(self, path: str, max_entries: int = 100) -> dict:
         """List directory contents. Low-risk, no approval required."""
+        if not path:
+            return {"error": "list_dir requires a non-empty 'path' parameter"}
         return ListDirExecutor().run(Path(path), max_entries=max_entries)
 
     def grep(self, pattern: str, path: str, max_results: int = 50) -> dict:
         """Search for a regex pattern. Low-risk, no approval required."""
+        if not path:
+            return {"error": "grep requires a non-empty 'path' parameter"}
         return GrepExecutor().run(
             pattern=pattern, root=Path(path), max_results=max_results
         )
