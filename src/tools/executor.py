@@ -306,6 +306,7 @@ class SearchResult:
 class WebSearchResult:
     results: list
     error: str = ""
+    answer: str = ""
 
 
 class WebSearchAdapter:
@@ -320,8 +321,9 @@ class TavilyAdapter(WebSearchAdapter):
 
     _BASE_URL = "https://api.tavily.com/search"
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, max_tokens: int = 6000):
         self._api_key = api_key
+        self._max_tokens = max_tokens
 
     def search(self, query: str, max_results: int = 5) -> WebSearchResult:
         import requests
@@ -332,9 +334,12 @@ class TavilyAdapter(WebSearchAdapter):
                 json={
                     "query": query,
                     "max_results": max_results,
-                    "include_answer": False,
+                    "search_depth": "advanced",
+                    "include_raw_content": False,
+                    "max_tokens": self._max_tokens,
+                    "include_answer": True,
                 },
-                timeout=15,
+                timeout=20,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -346,7 +351,7 @@ class TavilyAdapter(WebSearchAdapter):
                 )
                 for r in data.get("results", [])
             ]
-            return WebSearchResult(results=results)
+            return WebSearchResult(results=results, answer=data.get("answer"))
         except Exception as exc:
             return WebSearchResult(results=[], error=str(exc))
 

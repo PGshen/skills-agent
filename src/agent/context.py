@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date
 from typing import TYPE_CHECKING, Optional
 
 from agent.multi_agent import SubTask, TaskResult
@@ -126,7 +127,8 @@ class ClassifyAndAnswerContextBuilder:
     """
 
     def build(self, user_input: str, history_messages: list[dict]) -> list[dict]:
-        msgs: list[dict] = [{"role": "system", "content": _CLASSIFY_AND_ANSWER_SYSTEM}]
+        system = f"Today's date is {date.today().isoformat()}.\n" + _CLASSIFY_AND_ANSWER_SYSTEM
+        msgs: list[dict] = [{"role": "system", "content": system}]
         msgs.extend(history_messages)
         msgs.append({"role": "user", "content": user_input})
         return msgs
@@ -297,7 +299,8 @@ class OrchestratorContextBuilder:
 # ── ReactContextBuilder ───────────────────────────────────────────────────────
 
 _REACT_SYSTEM_HEADER = """\
-You are an executor agent. Your ONLY job is to complete this ONE task:
+You are an executor agent. Today's date is {today}.
+Your ONLY job is to complete this ONE task:
 
 OVERALL GOAL: {goal}
 
@@ -361,6 +364,7 @@ def _build_react_system_prompt(task: SubTask, available_tools: list[str]) -> str
     if task.context:
         context_section = f"BACKGROUND:\n{task.context}\n"
     return _REACT_SYSTEM_HEADER.format(
+        today=date.today().isoformat(),
         task_description=task.description,
         context_section=context_section,
         goal=task.goal or task.description,
