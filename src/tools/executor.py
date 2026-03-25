@@ -1,7 +1,8 @@
-"""Tool executors: read_file, list_dir, grep, run_script."""
+"""Tool executors: read_file, list_dir, grep, run_script, run_shell."""
 import logging
 import os
 import re
+import shlex
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -289,6 +290,114 @@ class DeleteFileExecutor:
             return DeleteFileResult(success=False, error=f"Permission denied: {exc}")
         except Exception as exc:
             return DeleteFileResult(success=False, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Shell command executor
+# ---------------------------------------------------------------------------
+
+# Commands that are inherently destructive or have elevated-privilege effects
+_HIGH_RISK_COMMANDS = frozenset({
+    "rm", "rmdir", "shred", "wipe",          # deletion
+    "mv",                                     # move / overwrite
+    "chmod", "chown", "chgrp",               # permission changes
+    "sudo", "su", "doas", "pkexec",          # privilege escalation
+    "mkfs", "dd", "fdisk", "parted",         # disk operations
+    "kill", "pkill", "killall",              # process termination
+    "truncate",                              # file truncation
+    "passwd", "userdel", "groupdel",         # user/auth management
+    "iptables", "ufw", "firewall-cmd",       # firewall changes
+    "systemctl", "launchctl",               # service management
+    "crontab",                               # scheduled tasks
+})
+
+# Commands with side effects but lower destructive potential
+_MEDIUM_RISK_COMMANDS = frozenset({
+    "cp", "rsync",                           # copy (can overwrite)
+    "mkdir", "touch", "ln",                  # filesystem creation / symlinks
+    "curl", "wget",                          # network downloads
+    "pip", "pip3", "npm", "yarn",            # package installation
+    "apt", "apt-get", "brew", "yum", "dnf", # system package managers
+    "git",                                   # version control
+    "python", "python3", "node", "ruby",     # arbitrary code execution
+    "bash", "sh", "zsh", "fish",            # sub-shells
+})
+
+
+def classify_shell_risk(command: str) -> str:
+    """Return ``"high"``, ``"medium"``, or ``"low"`` for *command*.
+
+    Parses the first token of the command to identify the executable, then
+    matches it against known dangerous / medium-risk lists.  Unparseable
+    commands are treated as ``"high"`` (fail-safe).
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return "high"  # unquoted / malformed shell syntax → assume dangerous
+
+    if not parts:
+        return "low"
+
+    cmd = Path(parts[0]).name  # strip any leading path component
+    if cmd in _HIGH_RISK_COMMANDS:
+        return "high"
+    if cmd in _MEDIUM_RISK_COMMANDS:
+        return "medium"
+    return "low"
+
+
+@dataclass
+class ShellCommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+
+class ShellCommandExecutor:
+    """Execute an arbitrary shell command string in a controlled subprocess.
+
+    Uses ``shell=True`` intentionally — callers are responsible for obtaining
+    explicit user approval before invoking this executor (see ToolsRuntime).
+    """
+
+    DEFAULT_TIMEOUT = 30
+
+    def execute(
+        self,
+        command: str,
+        cwd: Optional[str] = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        env_overrides: Optional[dict] = None,
+    ) -> ShellCommandResult:
+        clean_env = {k: v for k, v in os.environ.items() if k in _ENV_WHITELIST}
+        if env_overrides:
+            clean_env.update(env_overrides)
+
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+                env=clean_env,
+            )
+            return ShellCommandResult(
+                returncode=proc.returncode,
+                stdout=proc.stdout[:MAX_OUTPUT_CHARS],
+                stderr=proc.stderr[:MAX_OUTPUT_CHARS],
+                timed_out=False,
+            )
+        except subprocess.TimeoutExpired:
+            return ShellCommandResult(
+                returncode=-1,
+                stdout="",
+                stderr=f"Command timed out after {timeout}s",
+                timed_out=True,
+            )
 
 
 # ---------------------------------------------------------------------------

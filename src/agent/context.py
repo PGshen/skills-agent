@@ -135,11 +135,16 @@ class ClassifyAndAnswerContextBuilder:
         system = f"Today's date is {date.today().isoformat()}.\n" + _CLASSIFY_AND_ANSWER_SYSTEM
         if skills_index and skills_index != "(no skills available)":
             system += (
-                "\n\nAVAILABLE SKILLS (specialized task instructions):\n"
-                f"{skills_index}\n"
-                "When the user's request matches or is closely related to one of these skills "
-                '(e.g. reviewing code → code-review, committing → git-commit), route as "medium". '
-                "Prefer routing to a skill over answering directly whenever a relevant skill exists."
+                "\n\nAVAILABLE SKILLS (specialized task-instruction sets):\n"
+                "Skills are curated instruction bundles — each one tells the executor agent exactly "
+                "how to perform a specific type of task with consistent, high-quality results. "
+                "When a skill matches the user's request, routing to it is always preferable to "
+                "answering from general knowledge, because the skill encodes the right approach, "
+                "tools, and steps for that task type.\n\n"
+                f"{skills_index}\n\n"
+                'Route as "medium" whenever the request matches or is closely related to one of '
+                "these skills (e.g. reviewing code → code-review, committing → git-commit). "
+                "Prefer routing to a skill over a direct answer even when you could answer directly."
             )
         msgs: list[dict] = [{"role": "system", "content": system}]
         msgs.extend(history_messages)
@@ -371,11 +376,15 @@ def _build_skills_section(skills_index: str) -> str:
         return ""
     return (
         "\n\n### Skills  (task-specific instruction sets)\n"
-        "IMPORTANT: If a skill below matches your task, call load_skill FIRST "
-        "before using any other tools — it provides the instructions and approach you should follow.\n"
+        "Skills are curated instruction bundles. Calling load_skill injects the skill's "
+        "step-by-step guidance directly into your context — after loading, read and follow "
+        "those instructions to complete the task. This is always more reliable than improvising.\n"
+        "RULE: If a skill below matches your task, call load_skill FIRST before any other tool.\n"
+        "\nAvailable skills:\n"
         f"{skills_index}\n"
+        "\nSkill tools:\n"
         '- "load_skill":    {{"skill_name": "<name>"}}'
-        "  — load task-specific instructions into context\n"
+        "  — inject task-specific instructions into context, then follow them\n"
         '- "load_resource": {{"skill_name": "<name>", "resource": "<rel-path>", '
         '"section_hint": "<optional-section>"}}'
         "  — load a skill's reference file"

@@ -7,7 +7,15 @@ from pathlib import Path
 import pytest
 
 from skills.metadata import ResourceLimits, SkillMetadata
-from tools.executor import GrepExecutor, ListDirExecutor, ReadFileExecutor, ScriptExecutor, ScriptResult
+from tools.executor import (
+    GrepExecutor,
+    ListDirExecutor,
+    ReadFileExecutor,
+    ScriptExecutor,
+    ScriptResult,
+    ShellCommandExecutor,
+    classify_shell_risk,
+)
 from tools.permissions import PermissionChecker
 from tools.approval import ApprovalManager, ApprovalRequest
 from tools.runtime import (
@@ -338,3 +346,121 @@ class TestReadOnlyExecutors:
     def test_grep_invalid_regex(self, tmp_path):
         result = GrepExecutor().run(pattern="[invalid", root=tmp_path)
         assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# classify_shell_risk
+# ---------------------------------------------------------------------------
+
+class TestClassifyShellRisk:
+    def test_rm_is_high(self):
+        assert classify_shell_risk("rm -rf /tmp/foo") == "high"
+
+    def test_sudo_is_high(self):
+        assert classify_shell_risk("sudo apt-get install foo") == "high"
+
+    def test_kill_is_high(self):
+        assert classify_shell_risk("kill -9 1234") == "high"
+
+    def test_mv_is_high(self):
+        assert classify_shell_risk("mv old.txt new.txt") == "high"
+
+    def test_git_is_medium(self):
+        assert classify_shell_risk("git commit -m 'msg'") == "medium"
+
+    def test_cp_is_medium(self):
+        assert classify_shell_risk("cp src dst") == "medium"
+
+    def test_python_is_medium(self):
+        assert classify_shell_risk("python3 script.py") == "medium"
+
+    def test_ls_is_low(self):
+        assert classify_shell_risk("ls -la") == "low"
+
+    def test_echo_is_low(self):
+        assert classify_shell_risk("echo hello") == "low"
+
+    def test_empty_is_low(self):
+        assert classify_shell_risk("") == "low"
+
+    def test_absolute_path_rm_is_high(self):
+        assert classify_shell_risk("/bin/rm -rf /tmp") == "high"
+
+    def test_malformed_quotes_is_high(self):
+        assert classify_shell_risk("echo 'unclosed") == "high"
+
+
+# ---------------------------------------------------------------------------
+# ShellCommandExecutor
+# ---------------------------------------------------------------------------
+
+class TestShellCommandExecutor:
+    def test_simple_command(self, tmp_path):
+        result = ShellCommandExecutor().execute("echo hello", cwd=str(tmp_path))
+        assert result.returncode == 0
+        assert "hello" in result.stdout
+        assert result.timed_out is False
+
+    def test_stderr_captured(self, tmp_path):
+        result = ShellCommandExecutor().execute(
+            "echo err >&2", cwd=str(tmp_path)
+        )
+        assert "err" in result.stderr
+
+    def test_nonzero_exit(self, tmp_path):
+        result = ShellCommandExecutor().execute("exit 5", cwd=str(tmp_path))
+        assert result.returncode == 5
+
+    def test_timeout(self, tmp_path):
+        result = ShellCommandExecutor().execute("sleep 60", cwd=str(tmp_path), timeout=1)
+        assert result.timed_out is True
+        assert result.returncode == -1
+
+    def test_env_overrides(self, tmp_path):
+        result = ShellCommandExecutor().execute(
+            "echo $MY_VAR", cwd=str(tmp_path), env_overrides={"MY_VAR": "injected"}
+        )
+        assert "injected" in result.stdout
+
+    def test_cwd_respected(self, tmp_path):
+        result = ShellCommandExecutor().execute("pwd", cwd=str(tmp_path))
+        assert str(tmp_path) in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# ToolsRuntime.run_shell
+# ---------------------------------------------------------------------------
+
+class TestToolsRuntimeRunShell:
+    def test_low_risk_executes_without_approval(self, tmp_path):
+        runtime = ToolsRuntime(interactive=False)
+        result = runtime.run_shell("echo hello", cwd=str(tmp_path))
+        assert result["returncode"] == 0
+        assert "hello" in result["stdout"]
+
+    def test_high_risk_denied_in_non_interactive(self, tmp_path):
+        runtime = ToolsRuntime(interactive=False)
+        with pytest.raises(ApprovalDeniedError):
+            runtime.run_shell("rm -rf /tmp/nonexistent", cwd=str(tmp_path))
+
+    def test_medium_risk_denied_in_non_interactive(self, tmp_path):
+        runtime = ToolsRuntime(interactive=False)
+        with pytest.raises(ApprovalDeniedError):
+            runtime.run_shell("git status", cwd=str(tmp_path))
+
+    def test_high_risk_approved_via_run_approval(self, tmp_path):
+        runtime = ToolsRuntime(interactive=False)
+        runtime._approval._run_approvals.add("run_shell")
+        result = runtime.run_shell("echo ok", cwd=str(tmp_path))
+        # echo is low-risk so no approval needed; pre-seeded approval still works
+        assert result["returncode"] == 0
+
+    def test_tool_not_allowed_when_excluded(self, tmp_path):
+        runtime = ToolsRuntime(global_allowed_tools=["read_file"], interactive=False)
+        with pytest.raises(ToolNotAllowedError):
+            runtime.run_shell("echo hi", cwd=str(tmp_path))
+
+    def test_returns_timed_out_flag(self, tmp_path):
+        runtime = ToolsRuntime(interactive=False)
+        result = runtime.run_shell("sleep 60", cwd=str(tmp_path), timeout=1)
+        assert result["timed_out"] is True

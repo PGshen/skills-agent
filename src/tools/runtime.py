@@ -11,9 +11,12 @@ from tools.executor import (
     ReadFileExecutor,
     ScriptExecutor,
     ScriptResult,
+    ShellCommandExecutor,
+    ShellCommandResult,
     WebSearchAdapter,
     WebSearchExecutor,
     WriteFileExecutor,
+    classify_shell_risk,
 )
 from tools.permissions import PermissionChecker
 
@@ -66,7 +69,7 @@ class ToolsRuntime:
         self._permission = PermissionChecker(
             global_allowed_tools or [
                 "read_file", "list_dir", "grep", "run_script",
-                "write_file", "delete_file", "web_search",
+                "write_file", "delete_file", "web_search", "run_shell",
             ]
         )
         self._approval = ApprovalManager(interactive=interactive)
@@ -220,6 +223,54 @@ class ToolsRuntime:
         if not result.success:
             return {"error": result.error}
         return {"success": True}
+
+    def run_shell(
+        self,
+        command: str,
+        cwd: str | None = None,
+        timeout: int = 30,
+        env_overrides: dict | None = None,
+    ) -> dict:
+        """
+        Execute an arbitrary shell command.
+
+        Risk is classified automatically:
+          - ``high``   (rm, sudo, kill, …) — always requires explicit approval.
+          - ``medium`` (cp, git, pip, …)   — requires approval.
+          - ``low``    (ls, echo, cat, …)  — executes without prompting.
+
+        Returns ``{"returncode": int, "stdout": str, "stderr": str}``
+        or ``{"error": "..."}`` on permission / approval failure.
+        """
+        if not self._permission.check("run_shell"):
+            raise ToolNotAllowedError("run_shell is not in the allowed tool set")
+
+        risk = classify_shell_risk(command)
+
+        if risk in ("high", "medium"):
+            req = ApprovalRequest(
+                tool="run_shell",
+                risk=risk,
+                params={"command": command, "cwd": cwd or ""},
+                skill_name="",
+            )
+            if not self._approval.request(req):
+                raise ApprovalDeniedError(
+                    f"User denied run_shell approval for command: {command!r}"
+                )
+
+        result: ShellCommandResult = ShellCommandExecutor().execute(
+            command=command,
+            cwd=cwd,
+            timeout=timeout,
+            env_overrides=env_overrides,
+        )
+        return {
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "timed_out": result.timed_out,
+        }
 
     def delete_file(self, path: str) -> dict:
         """
